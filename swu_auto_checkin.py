@@ -12,15 +12,24 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 MAX_RETRY = 3
 
 def get_swu_token(username: str, password: str, headless: bool = True) -> str:
-    """登录并获取 access_token，支持自动重试验证码"""
     co = ChromiumOptions()
+    
+    # 使用环境变量指定的浏览器路径（Actions 中由 setup-chrome 提供）
+    chrome_path = os.environ.get("CHROME_PATH")
+    if chrome_path:
+        co.set_browser_path(chrome_path)
+    
     if headless:
-        # 新版无头模式 + Linux 必须的参数
-        co.set_argument('--headless=new')      # 关键：使用新版无头模式
+        co.headless = True                     # 使用 DrissionPage 自带的无头模式
         co.set_argument('--no-sandbox')
         co.set_argument('--disable-dev-shm-usage')
         co.set_argument('--disable-gpu')
         co.set_argument('--window-size=1920,1080')
+        # 注意：不再手动添加 --headless=new，避免冲突
+
+    last_exception = None
+    file_path = None
+    # ... 后面不变（从 for attempt in range... 开始）
         # 使用临时目录避免冲突
         import tempfile
         user_data_dir = tempfile.mkdtemp()
