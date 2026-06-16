@@ -1,40 +1,36 @@
-# 工作流名称，会显示在 GitHub Actions 页面
-name: SWU Daily Checkin
+name: 西南大学每日打卡
 
-# 触发器：定义工作流何时自动运行
 on:
-  # 定时触发：使用 cron 表达式，此处为北京时间每天 21:30 (UTC 13:30)
   schedule:
-    - cron: '30 13 * * *'
-  # 手动触发：允许在 Actions 页面点击按钮运行
-  workflow_dispatch:
+    # 北京时间 23:30 执行（UTC 15:30）
+    - cron: '30 15 * * *'
+  workflow_dispatch:              # 支持手动触发（用于测试）
 
-# 工作流中包含的作业（可以多个，这里只有一个 checkin）
 jobs:
   checkin:
-    # 指定运行环境：self-hosted 表示使用您自己的计算机作为运行器
-    # 如果您的自托管运行器有额外标签（如 Windows、X64），可一并写上
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
 
-    # 步骤集合
     steps:
-      # 第一步：将仓库代码检出到运行器上
-      - name: Checkout repository
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      # 第二步：设置 Python 环境（版本 3.11）
-      - name: Set up Python
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
-      # 第三步：安装项目依赖
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: 安装系统依赖（Chromium 浏览器）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser
 
-      # 第四步：运行签到脚本，通过环境变量传递账号密码
-      - name: Run checkin script
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install drissionpage ddddocr requests
+
+      - name: 执行打卡脚本
         env:
-          SWU_USERNAME: ${{ secrets.SWU_USERNAME }}   # 从仓库 Secrets 读取
+          SWU_USERNAME: ${{ secrets.SWU_USERNAME }}
           SWU_PASSWORD: ${{ secrets.SWU_PASSWORD }}
-        run: python swu_auto_checkin.py
+        run: python checkin.py
