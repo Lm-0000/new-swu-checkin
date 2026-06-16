@@ -2,7 +2,7 @@ name: SWU Daily Checkin
 
 on:
   schedule:
-    - cron: '30 13 * * *'   # 北京时间 21:30
+    - cron: '30 13 * * *'
   workflow_dispatch:
 
 jobs:
@@ -16,7 +16,7 @@ jobs:
         id: setup-chrome
         uses: browser-actions/setup-chrome@v1
         with:
-          chrome-version: stable
+          chrome-version: '115'   # 关键：与 DrissionPage 兼容
 
       - name: Set up Python
         uses: actions/setup-python@v5
