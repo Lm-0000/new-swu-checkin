@@ -2,23 +2,23 @@ name: SWU Daily Checkin
 
 on:
   schedule:
-    - cron: '30 13 * * *'   # 北京时间 21:30
+    - cron: '30 13 * * *'
   workflow_dispatch:
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # 消除 Node.js 20 弃用警告
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Chrome 115
+      - name: Setup Chrome
         id: setup-chrome
         uses: browser-actions/setup-chrome@v1
         with:
-          chrome-version: '115'   # 关键：与 DrissionPage 兼容的版本
+          chrome-version: '115'
 
       - name: Set up Python
         uses: actions/setup-python@v5
