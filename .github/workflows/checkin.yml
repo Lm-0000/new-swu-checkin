@@ -8,16 +8,16 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # 强制使用 Node.js 24
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Setup Chrome
         id: setup-chrome
         uses: browser-actions/setup-chrome@v1
         with:
-          chrome-version: '115'   # 关键：与 DrissionPage 4.1.1.4 兼容
-
+          chrome-version: '115'
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
