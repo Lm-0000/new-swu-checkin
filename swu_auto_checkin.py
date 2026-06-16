@@ -4,86 +4,80 @@
 import os
 import time
 import json
-import tempfile
 import ddddocr
 import requests
 from DrissionPage import ChromiumPage, ChromiumOptions
-
 MAX_RETRY = 3
 
+
 def get_swu_token(username: str, password: str, headless: bool = True) -> str:
-    """
-    登录并获取 access_token，支持验证码重试，兼容 GitHub Actions 无头环境。
-    """
+    """登录并获取 access_token，适配 GitHub Actions（Chrome 115）"""
     co = ChromiumOptions()
 
     is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
-
     if is_ci:
-        # --- GitHub Actions 环境适配 ---
+        # 指定 GitHub Actions 安装的 Chrome 路径
         chrome_path = os.environ.get('CHROME_PATH')
         if chrome_path:
             co.set_browser_path(chrome_path)
-
+        # Linux 无头必要参数
         co.set_argument('--no-sandbox')
         co.set_argument('--disable-dev-shm-usage')
         co.set_argument('--disable-gpu')
         co.set_argument('--disable-setuid-sandbox')
         co.set_argument('--window-size=1920,1080')
-
-        # 使用 DrissionPage 内置的无头模式，避免 --headless=new 导致的 CDP 404
+        # 使用 DrissionPage 内置无头，不添加 --headless=new
         co.headless = True
-
-        # 临时用户目录，防止冲突
+        # 防止用户目录冲突
+        import tempfile
         co.set_user_data_path(tempfile.mkdtemp())
     else:
-        # 本地运行（Windows）
+        # 本地 Windows 设置
         co.headless = headless
         co.set_argument('--window-size=1920,1080')
 
-    # 自动分配可用端口（避免 9222 被占用）
+    # 自动分配可用端口，避免 9222 被占用
     co.auto_port()
 
     last_exception = None
     file_path = None
-
     for attempt in range(1, MAX_RETRY + 1):
         dp = None
         try:
             dp = ChromiumPage(co)
-            login_url = ('https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL'
-                         '?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle'
-                         '%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return'
-                         '%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin'
-                         '%253Ffrom%253D%25252FappCenter')
+            login_url = (
+                'https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL'
+                '?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle'
+                '%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return'
+                '%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin'
+                '%253Ffrom%253D%25252FappCenter'
+            )
             dp.get(login_url)
 
-            # 1. 点击统一身份认证按钮（两种定位方式）
+            # 点击统一身份认证按钮（两种定位方式）
             unified_btn = dp.ele('@src=img/unified_button.png', timeout=5)
             if not unified_btn:
                 unified_btn = dp.ele('div[onclick="_goLogin()"]', timeout=5)
             if unified_btn:
                 unified_btn.click()
-                time.sleep(2)   # 等待跳转
+                time.sleep(2)
 
-            # 2. 输入账号密码（优先使用 class=hd 索引，失败则用 id 定位）
+            # 输入账号密码（优先用 class=hd，失败则用 id）
             try:
                 username_input = dp.ele('@class=hd', index=1, timeout=5)
                 password_input = dp.ele('@class=hd', index=2, timeout=5)
             except Exception:
-                # 备用定位
                 username_input = dp.ele('#loginName', timeout=5)
                 password_input = dp.ele('#password', timeout=5)
 
             username_input.clear().input(username)
             password_input.clear().input(password)
 
-            # 3. 验证码处理
+            # 验证码处理
             os.makedirs('images', exist_ok=True)
             img = dp.ele('@id=kaptchaImage', timeout=5)
             if not img:
-                # 备用：查找 src 包含 'validate' 的图片
-                img = dp.ele('@src=validate', timeout=5)
+                img = dp.ele('@src=validate', timeout=5)  # 备用
             if not img:
                 raise Exception("未找到验证码图片")
 
@@ -98,14 +92,12 @@ def get_swu_token(username: str, password: str, headless: bool = True) -> str:
             result = ocr.classification(image_bytes)
             print(f"[尝试 {attempt}/{MAX_RETRY}] 识别验证码: {result}")
 
-            # 4. 输入验证码
+            # 输入验证码
             captcha_input = dp.ele('@class=dfinput', timeout=3)
             if not captcha_input:
-                # 取最后一个文本输入框
                 captcha_input = dp.eles('tag=input@@type=text')[-1]
             captcha_input.clear()
             dp.actions.click(captcha_input).type(result)
-            # 触发前端事件，确保表单验证通过
             dp.run_js('''
                 var el = arguments[0];
                 el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -114,7 +106,7 @@ def get_swu_token(username: str, password: str, headless: bool = True) -> str:
             ''', captcha_input)
             time.sleep(0.3)
 
-            # 5. 点击登录按钮
+            # 点击登录
             login_btn = dp.ele('@style=vertical-align: top;', timeout=5)
             if not login_btn:
                 login_btn = dp.ele('.btn.btn-default.blue', timeout=5)
@@ -122,7 +114,6 @@ def get_swu_token(username: str, password: str, headless: bool = True) -> str:
                 login_btn = dp.ele('tag=input@@type=submit', timeout=5)
             login_btn.click()
 
-            # 6. 等待跳转，获取 token
             print("等待页面跳转加载...")
             time.sleep(8)
 
@@ -131,24 +122,21 @@ def get_swu_token(username: str, password: str, headless: bool = True) -> str:
                 time.sleep(1)
                 try:
                     token = dp.run_js(
-                        'return localStorage.getItem("access_token") || sessionStorage.getItem("access_token")'
-                    )
+                        'return localStorage.getItem("access_token") || sessionStorage.getItem("access_token")')
                     if token:
                         return token
                 except Exception as e:
-                    print(f"读取 token 时异常: {e}，继续等待...")
+                    print(f"读取 token 时异常: {e}")
 
-                # 检查验证码错误提示
                 try:
                     err = dp.ele('#err', timeout=0.2)
                     if err and ('验证码错误' in err.text or '验证码不正确' in err.text):
                         print("验证码错误，准备重试...")
                         break
-                except Exception:
+                except:
                     pass
             else:
                 raise Exception("获取 token 超时，可能登录失败")
-
         except Exception as e:
             last_exception = e
             print(f"第 {attempt} 次尝试失败: {e}")
@@ -188,7 +176,7 @@ def checkin(token: str):
         print("❌ 今日无打卡任务")
         return False
     if task.get("qdzt") == "已签到":
-        print("✅ 今日已打卡，无需重复操作")
+        print("✅ 今日已打卡")
         return True
 
     student_id = get_student_id(token)
@@ -222,7 +210,7 @@ def main():
 
     try:
         print("开始自动登录获取 token...")
-        token = get_swu_token(username, password, headless=True)
+        token = get_swu_token(username, password)
         print(f"获取 token 成功: {token[:10]}...")
         print("正在执行打卡...")
         success = checkin(token)
