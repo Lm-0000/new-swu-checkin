@@ -1,1 +1,37 @@
+name: SWU Daily Checkin
 
+on:
+  schedule:
+    - cron: '30 13 * * *'   # 北京时间 21:30
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # 消除 Node.js 弃用警告
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Chrome
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: '115'   # 与 DrissionPage 4.1.x 兼容的版本
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run checkin script
+        env:
+          SWU_USERNAME: ${{ secrets.SWU_USERNAME }}
+          SWU_PASSWORD: ${{ secrets.SWU_PASSWORD }}
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: python swu_auto_checkin.py  # 注意：CI 下我们强制使用脚本内设置的无头模式，但加上 --no-headless 可让脚本以有头模式运行（会因无显示器失败）。因此这里不加 --no-headless，直接运行。
