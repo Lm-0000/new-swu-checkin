@@ -4,8 +4,8 @@ on:
   schedule:
     # 北京时间 21:00 
     - cron: '5 13 * * *'
-    # 北京时间 22:00
-    - cron: '0 14 * * *'
+    # 北京时间 22:05
+    - cron: '05 14 * * *'
   workflow_dispatch:
 
 jobs:
