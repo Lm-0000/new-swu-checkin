@@ -46,7 +46,7 @@ def get_available_port():
         return s.getsockname()[1]
 
 # ---------- 登录模块 ----------
-def get_swu_token(username: str, password: str, headless: bool = False, max_retries: int = 3):
+def get_swu_token(username: str, password: str, headless: bool = False, max_retries: int = 1):
     chrome_path = get_chrome_path()
     print(f"✅ 使用 Chrome: {chrome_path}")
 
@@ -293,11 +293,11 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
 
     raise Exception(f"登录失败，已重试 {max_retries} 次。")
 
-# ---------- 打卡模块（自动选择 requests 或同步 XHR） ----------
+# ---------- 打卡模块 ----------
 def is_github_actions():
     return os.environ.get('GITHUB_ACTIONS') == 'true'
 
-# 原始 requests 实现
+# 本地 requests 实现
 def get_transition_today_requests(token):
     url = "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday"
     headers = {"fighter-auth-token": token}
@@ -347,48 +347,24 @@ def checkin_requests(token):
         print(f"❌ 打卡失败: {resp.get('msg', '未知错误')}")
         return False
 
-# 同步 XHR 实现（用于 GitHub Actions）
-def xhr_in_browser(dp, url, method='GET', headers=None, data=None, json_data=None, params=None):
-    """使用同步 XMLHttpRequest 在浏览器中发起请求，返回 Python 字典"""
-    headers_js = json.dumps(headers) if headers else '{}'
+# GitHub Actions 浏览器内 dp.download 实现
+def api_download(dp, url, method='GET', headers=None, data=None, json_data=None, params=None):
+    """使用 dp.download 发起请求，返回 Python 字典"""
+    kwargs = {}
+    if headers:
+        kwargs['headers'] = headers
+    if json_data:
+        kwargs['json'] = json_data
+    elif data:
+        kwargs['data'] = data
     if params:
-        url_with_params = url + '?' + urllib.parse.urlencode(params)
-    else:
-        url_with_params = url
-    body = json_data if json_data else data
-    body_js = json.dumps(body) if body else 'null'
+        url += '?' + urllib.parse.urlencode(params)
 
-    js_code = f'''
-    (function() {{
-        var xhr = new XMLHttpRequest();
-        xhr.open('{method}', '{url_with_params}', false);  // false = 同步
-        var headers = {headers_js};
-        for (var key in headers) {{
-            xhr.setRequestHeader(key, headers[key]);
-        }}
-        try {{
-            if ('{method}' === 'POST' || '{method}' === 'PUT') {{
-                xhr.send(JSON.stringify({body_js}));
-            }} else {{
-                xhr.send();
-            }}
-        }} catch (e) {{
-            return JSON.stringify({{error: e.message}});
-        }}
-        if (xhr.status >= 200 && xhr.status < 300) {{
-            return xhr.responseText;
-        }} else {{
-            return JSON.stringify({{error: 'HTTP ' + xhr.status + ': ' + xhr.responseText}});
-        }}
-    }})()
-    '''
-    result = dp.run_js(js_code)
-    if result is None:
-        raise Exception("同步 XHR 返回了 None")
-    data = json.loads(result)
-    if isinstance(data, dict) and 'error' in data:
-        raise Exception(data['error'])
-    return data
+    # 调用 download，返回 (session, response) 元组
+    session, resp = dp.download(url, method=method, **kwargs)
+    content = resp.content()
+    resp.close()
+    return json.loads(content)
 
 def checkin_browser(token, dp):
     print("正在跳转到办事大厅首页...")
@@ -397,9 +373,9 @@ def checkin_browser(token, dp):
     print(f"当前页面 URL: {dp.url}")
 
     # 1. 获取今日任务
-    task_data = xhr_in_browser(dp, "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday",
-                               method='POST', headers={"fighter-auth-token": token},
-                               data={"pageNum": 1, "pageSize": 1})
+    task_data = api_download(dp, "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday",
+                             method='POST', headers={"fighter-auth-token": token},
+                             data={"pageNum": 1, "pageSize": 1})
     records = task_data.get("data", {}).get("records", [])
     task = records[0] if records else None
     if not task:
@@ -410,8 +386,8 @@ def checkin_browser(token, dp):
         return True
 
     # 2. 获取学号
-    user_data = xhr_in_browser(dp, "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal",
-                               method='GET', headers={"fighter-auth-token": token})
+    user_data = api_download(dp, "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal",
+                             method='GET', headers={"fighter-auth-token": token})
     student_id = user_data["data"]["subject"]["username"]
     print(f"当前用户学号: {student_id}")
 
@@ -431,7 +407,7 @@ def checkin_browser(token, dp):
         "xh": student_id,
         "qdsj": CHECKIN_TIME_RANGE,
     }
-    save_data = xhr_in_browser(dp, url, method='POST', headers=headers, json_data=payload, params=params)
+    save_data = api_download(dp, url, method='POST', headers=headers, json_data=payload, params=params)
     if save_data.get("code") == 200 and save_data.get("data"):
         print("✅ 打卡成功！")
         return True
@@ -442,7 +418,7 @@ def checkin_browser(token, dp):
 # 统一入口
 def checkin(token, dp=None):
     if is_github_actions():
-        print("检测到 GitHub Actions 环境，使用同步 XHR 请求...")
+        print("检测到 GitHub Actions 环境，使用浏览器下载请求...")
         if not dp:
             raise Exception("浏览器对象未传入")
         return checkin_browser(token, dp)
