@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import time
 import json
 import argparse
@@ -12,10 +13,11 @@ import ddddocr
 import requests
 from DrissionPage import ChromiumPage, ChromiumOptions
 
-MANUAL_TOKEN = ""
+# ==================== 配置区 ====================
+MANUAL_TOKEN = ""                     # 留空则自动登录
 CHECKIN_TIME_RANGE = ["21:00", "23:30"]
 
-# ---------- 工具函数 ----------
+# ==================== 工具函数 ====================
 def get_chrome_path():
     chrome_path = os.environ.get('CHROME_PATH')
     if chrome_path and os.path.isfile(chrome_path):
@@ -45,8 +47,26 @@ def get_available_port():
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-# ---------- 登录模块 ----------
-def get_swu_token(username: str, password: str, headless: bool = False, max_retries: int = 1):
+# ==================== 登录模块 ====================
+def exchange_token_with_code(code: str) -> str:
+    """
+    使用授权码 code 换取真正的 fighter-auth-token
+    """
+    url = "https://of.swu.edu.cn/gateway/fighter-middle/api/integrate/uaap/cas/exchange-token"
+    params = {
+        "token": code,
+        "remember": "true"
+    }
+    resp = requests.get(url, params=params)
+    if resp.status_code != 200:
+        raise Exception(f"换取 token 失败，HTTP状态码: {resp.status_code}")
+    data = resp.json()
+    if "data" in data and data["data"]:
+        return data["data"]
+    else:
+        raise Exception(f"换取 token 失败: {data.get('msg', '未知错误')}")
+
+def get_swu_token(username: str, password: str, headless: bool = False, max_retries: int = 3):
     chrome_path = get_chrome_path()
     print(f"✅ 使用 Chrome: {chrome_path}")
 
@@ -223,62 +243,65 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            if 'Login' in dp.url or 'idm.swu.edu.cn' in dp.url:
-                print("⚠️ 页面未跳转，尝试使用 JavaScript 触发按钮...")
-                dp.run_js('''
-                    var btn = document.querySelector('[style*="vertical-align: top"]');
-                    if (!btn) btn = document.querySelector('.btn.btn-default.blue');
-                    if (!btn) btn = document.querySelector('input[type="submit"]');
-                    if (btn) {
-                        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                    }
-                ''')
-                time.sleep(3)
-                if 'Login' in dp.url or 'idm.swu.edu.cn' in dp.url:
-                    raise Exception("登录失败，可能是验证码错误或账号密码不正确")
-
-            # 获取 token
-            for i in range(60):
+            # ---------- 核心：从回调 URL 提取 code 并交换 token ----------
+            print("等待登录成功后跳转...")
+            for i in range(60):  # 最多等待30秒
                 time.sleep(0.5)
-                token = dp.run_js('''
-                    return localStorage.getItem('access_token') || 
-                           localStorage.getItem('token') ||
-                           sessionStorage.getItem('access_token') ||
-                           sessionStorage.getItem('token');
-                ''')
-                if token:
-                    print("✅ 从 localStorage/sessionStorage 获取 token 成功")
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                        try:
-                            os.rmdir('images')
-                        except:
-                            pass
-                    return token, dp
                 current_url = dp.url
-                if 'code=' in current_url:
+                # 优先：URL 包含 code 参数（通常在 of.swu.edu.cn 域名下）
+                if 'code=' in current_url and 'of.swu.edu.cn' in current_url:
                     parsed = urllib.parse.urlparse(current_url)
                     params = urllib.parse.parse_qs(parsed.query)
                     if 'code' in params:
-                        token = params['code'][0]
-                        print(f"✅ 从 URL 获取 code: {token}")
-                        return token, dp
-                for cookie in dp.cookies():
-                    if 'token' in cookie['name'].lower() or 'access' in cookie['name'].lower():
-                        token = cookie['value']
-                        print(f"✅ 从 cookie 获取 token: {cookie['name']}")
-                        return token, dp
+                        code = params['code'][0]
+                        print(f"获取到授权码 code: {code[:10]}...")
+                        try:
+                            real_token = exchange_token_with_code(code)
+                            print("✅ 成功换取访问令牌")
+                            # 清理临时文件
+                            if os.path.exists(file_path):
+                                os.remove(file_path)
+                                try:
+                                    os.rmdir('images')
+                                except:
+                                    pass
+                            return real_token
+                        except Exception as e:
+                            raise Exception(f"换取 token 失败: {e}")
+                # 备选：如果已经跳转到 of 主页且没有 code，尝试从 localStorage 取（用于兼容手动调试）
+                if 'of.swu.edu.cn' in current_url and 'code' not in current_url:
+                    token = dp.run_js('''
+                        return localStorage.getItem('access_token') || 
+                               localStorage.getItem('token') ||
+                               sessionStorage.getItem('access_token') ||
+                               sessionStorage.getItem('token');
+                    ''')
+                    if token:
+                        print("✅ 从 localStorage/sessionStorage 获取 token 成功，尝试验证有效性...")
+                        try:
+                            test_url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
+                            test_headers = {"fighter-auth-token": token}
+                            test_resp = requests.get(test_url, headers=test_headers)
+                            if test_resp.status_code == 200:
+                                print("✅ localStorage 中的 token 有效")
+                                if os.path.exists(file_path):
+                                    os.remove(file_path)
+                                    try:
+                                        os.rmdir('images')
+                                    except:
+                                        pass
+                                return token
+                            else:
+                                print("⚠️ localStorage 中的 token 无效，继续等待...")
+                        except:
+                            pass
                 if i % 10 == 0:
                     print(f"当前 URL ({i*0.5}s): {current_url[:100]}...")
 
-            raise Exception("未获取到 token")
+            raise Exception("获取 token 超时，未获取到有效的授权码或访问令牌")
 
         except Exception as e:
             print(f"第 {attempt} 次尝试失败: {e}")
-            try:
-                dp.quit()
-            except:
-                pass
             if os.path.exists('images/captcha.png'):
                 os.remove('images/captcha.png')
                 try:
@@ -290,143 +313,97 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             else:
                 print("等待 2 秒后重试...")
                 time.sleep(2)
+        finally:
+            try:
+                dp.quit()
+            except:
+                pass
 
     raise Exception(f"登录失败，已重试 {max_retries} 次。")
 
-# ---------- 打卡模块 ----------
-def is_github_actions():
-    return os.environ.get('GITHUB_ACTIONS') == 'true'
-
-# 本地 requests 实现
-def get_transition_today_requests(token):
+# ==================== 打卡模块 ====================
+def get_transition_today(token: str):
+    """查询今日打卡任务"""
     url = "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday"
     headers = {"fighter-auth-token": token}
     data = {"pageNum": 1, "pageSize": 1}
-    resp = requests.post(url, headers=headers, data=data).json()
-    records = resp.get("data", {}).get("records", [])
+    resp = requests.post(url, headers=headers, data=data)
+    if resp.status_code != 200:
+        raise Exception(f"查询任务失败，HTTP状态码: {resp.status_code}")
+    resp_data = resp.json()
+    records = resp_data.get("data", {}).get("records", [])
     return records[0] if records else None
 
-def get_student_id_requests(token):
+def get_student_id(token: str):
+    """获取当前登录用户的学号"""
     url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
     headers = {"fighter-auth-token": token}
-    resp = requests.get(url, headers=headers).json()
-    return resp["data"]["subject"]["username"]
+    resp = requests.get(url, headers=headers)
+    if resp.status_code != 200:
+        raise Exception(f"获取学号失败，HTTP状态码: {resp.status_code}")
+    return resp.json()["data"]["subject"]["username"]
 
-def checkin_requests(token):
-    task = get_transition_today_requests(token)
-    if not task:
-        print("❌ 今日无打卡任务")
-        return False
-    if task.get("qdzt") == "已签到":
-        print("✅ 今日已打卡，无需重复")
-        return True
+def checkin(token: str):
+    """
+    执行打卡，返回 (success, reason, exit_code)
+    exit_code: 0=成功/已签到, 10=无任务, 20=失败
+    """
+    try:
+        # 1. 获取今日任务
+        task = get_transition_today(token)
+        if not task:
+            msg = "今日无打卡任务"
+            print(f"ℹ️ {msg}")
+            return True, msg, 10   # 无任务视为正常
 
-    student_id = get_student_id_requests(token)
-    print(f"当前用户学号: {student_id}")
+        # 2. 检查是否已签到
+        if task.get("qdzt") == "已签到":
+            msg = "今日已签到，无需重复"
+            print(f"✅ {msg}")
+            return True, msg, 0    # 已签到视为成功
 
-    formid = task["formId"]
-    record_id = task["id"]
-    url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
-    params = {"formId": formid, "isSubmitProcess": False}
-    headers = {
-        "fighter-auth-token": token,
-        "Content-Type": "application/json;charset=UTF-8"
-    }
-    payload = {
-        "id": record_id,
-        "formId": formid,
-        "tsrq": time.strftime("%Y-%m-%d"),
-        "xh": student_id,
-        "qdsj": CHECKIN_TIME_RANGE,
-    }
-    resp = requests.post(url, headers=headers, params=params, data=json.dumps(payload)).json()
-    if resp.get("code") == 200 and resp.get("data"):
-        print("✅ 打卡成功！")
-        return True
-    else:
-        print(f"❌ 打卡失败: {resp.get('msg', '未知错误')}")
-        return False
+        # 3. 未签到，执行打卡
+        student_id = get_student_id(token)
+        print(f"当前用户学号: {student_id}")
 
-# GitHub Actions 浏览器内 dp.download 实现
-def api_download(dp, url, method='GET', headers=None, data=None, json_data=None, params=None):
-    """使用 dp.download 发起请求，返回 Python 字典"""
-    kwargs = {}
-    if headers:
-        kwargs['headers'] = headers
-    if json_data:
-        kwargs['json'] = json_data
-    elif data:
-        kwargs['data'] = data
-    if params:
-        url += '?' + urllib.parse.urlencode(params)
+        formid = task["formId"]
+        record_id = task["id"]
+        url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
+        params = {"formId": formid, "isSubmitProcess": False}
+        headers = {
+            "fighter-auth-token": token,
+            "Content-Type": "application/json;charset=UTF-8"
+        }
+        payload = {
+            "id": record_id,
+            "formId": formid,
+            "tsrq": time.strftime("%Y-%m-%d"),
+            "xh": student_id,
+            "qdsj": CHECKIN_TIME_RANGE,
+        }
 
-    # 调用 download，返回 (session, response) 元组
-    session, resp = dp.download(url, method=method, **kwargs)
-    content = resp.content()
-    resp.close()
-    return json.loads(content)
+        resp = requests.post(url, headers=headers, params=params, data=json.dumps(payload))
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") == 200 and data.get("data"):
+            msg = "打卡成功！"
+            print(f"✅ {msg}")
+            return True, msg, 0
+        else:
+            msg = f"打卡失败: {data.get('msg', '未知错误')}"
+            print(f"❌ {msg}")
+            return False, msg, 20
 
-def checkin_browser(token, dp):
-    print("正在跳转到办事大厅首页...")
-    dp.get('https://of.swu.edu.cn')
-    time.sleep(3)
-    print(f"当前页面 URL: {dp.url}")
+    except requests.exceptions.RequestException as e:
+        msg = f"网络请求异常: {e}"
+        print(f"❌ {msg}")
+        return False, msg, 20
+    except Exception as e:
+        msg = f"未知异常: {e}"
+        print(f"❌ {msg}")
+        return False, msg, 20
 
-    # 1. 获取今日任务
-    task_data = api_download(dp, "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday",
-                             method='POST', headers={"fighter-auth-token": token},
-                             data={"pageNum": 1, "pageSize": 1})
-    records = task_data.get("data", {}).get("records", [])
-    task = records[0] if records else None
-    if not task:
-        print("❌ 今日无打卡任务")
-        return False
-    if task.get("qdzt") == "已签到":
-        print("✅ 今日已打卡，无需重复")
-        return True
-
-    # 2. 获取学号
-    user_data = api_download(dp, "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal",
-                             method='GET', headers={"fighter-auth-token": token})
-    student_id = user_data["data"]["subject"]["username"]
-    print(f"当前用户学号: {student_id}")
-
-    # 3. 提交打卡
-    formid = task["formId"]
-    record_id = task["id"]
-    url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
-    params = {"formId": formid, "isSubmitProcess": False}
-    headers = {
-        "fighter-auth-token": token,
-        "Content-Type": "application/json;charset=UTF-8"
-    }
-    payload = {
-        "id": record_id,
-        "formId": formid,
-        "tsrq": time.strftime("%Y-%m-%d"),
-        "xh": student_id,
-        "qdsj": CHECKIN_TIME_RANGE,
-    }
-    save_data = api_download(dp, url, method='POST', headers=headers, json_data=payload, params=params)
-    if save_data.get("code") == 200 and save_data.get("data"):
-        print("✅ 打卡成功！")
-        return True
-    else:
-        print(f"❌ 打卡失败: {save_data.get('msg', '未知错误')}")
-        return False
-
-# 统一入口
-def checkin(token, dp=None):
-    if is_github_actions():
-        print("检测到 GitHub Actions 环境，使用浏览器下载请求...")
-        if not dp:
-            raise Exception("浏览器对象未传入")
-        return checkin_browser(token, dp)
-    else:
-        print("本地环境，使用 Python requests 请求...")
-        return checkin_requests(token)
-
-# ---------- 主程序 ----------
+# ==================== 主程序 ====================
 def main():
     parser = argparse.ArgumentParser(description='西南大学自动打卡（含自动登录）')
     parser.add_argument('--no-headless', action='store_true', help='禁用无头模式（显示浏览器）')
@@ -436,46 +413,37 @@ def main():
     username = os.environ.get('SWU_USERNAME')
     password = os.environ.get('SWU_PASSWORD')
     if not username or not password:
-        raise Exception("❌ 请设置环境变量 SWU_USERNAME 和 SWU_PASSWORD")
+        print("❌ 请设置环境变量 SWU_USERNAME 和 SWU_PASSWORD")
+        sys.exit(1)
 
     token = MANUAL_TOKEN.strip()
-    dp = None
     if not token:
         print("未指定手动 token，将自动登录获取...")
         try:
-            token, dp = get_swu_token(username, password, headless=headless_mode)
+            token = get_swu_token(username, password, headless=headless_mode)
             print(f"\n✅ 获取到的 token: {token[:10]}...")
         except Exception as e:
             print(f"❌ 自动登录失败: {e}")
-            return
+            sys.exit(1)
     else:
         print(f"使用手动指定的 token: {token[:10]}...")
-        if is_github_actions():
-            print("Actions 中暂不支持手动 token，请留空自动登录")
-            return
-        success = checkin(token)
-        if success:
-            print("打卡流程完成。")
-        else:
-            print("打卡失败，请检查网络或 token 状态。")
-        return
+        try:
+            student_id = get_student_id(token)
+            print(f"Token 有效，当前学号: {student_id}")
+        except Exception as e:
+            print(f"❌ Token 无效或已过期: {e}")
+            sys.exit(1)
 
+    # 执行打卡
     print("\n--- 开始打卡 ---")
-    try:
-        success = checkin(token, dp)
-        if success:
-            print("打卡流程完成。")
-        else:
-            print("打卡失败，请检查网络或 token 状态。")
-    finally:
-        if dp:
-            dp.quit()
-            if os.path.exists('images/captcha.png'):
-                os.remove('images/captcha.png')
-                try:
-                    os.rmdir('images')
-                except:
-                    pass
+    success, reason, exit_code = checkin(token)
+    if success:
+        # 所有成功情况（包括已签到、无任务）都返回0，但日志已区分
+        print(f"✅ 打卡流程完成：{reason}")
+        sys.exit(0)
+    else:
+        print(f"❌ 打卡失败：{reason}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
