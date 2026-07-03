@@ -9,6 +9,7 @@ import argparse
 import subprocess
 import urllib.parse
 import socket
+import shutil  # 新增用于删除目录
 import ddddocr
 import requests
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -47,7 +48,7 @@ def get_available_port():
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-# ==================== 登录模块（仅优化 token 提取部分） ====================
+# ==================== 登录模块 ====================
 def exchange_token_with_code(code: str) -> str:
     """
     使用授权码 code 换取真正的 fighter-auth-token
@@ -70,12 +71,18 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
     chrome_path = get_chrome_path()
     print(f"✅ 使用 Chrome: {chrome_path}")
 
+    # 根据模式确定用户数据目录（用于后续清理）
+    is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
+    if headless or is_ci:
+        user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci')
+    else:
+        user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data')
+
     for attempt in range(1, max_retries + 1):
         print(f"\n--- 第 {attempt} 次尝试登录 ---")
         co = ChromiumOptions()
         co.set_paths(browser_path=chrome_path)
 
-        is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
         if headless or is_ci:
             co.set_argument('--headless=new')
             co.set_argument('--no-sandbox')
@@ -86,14 +93,14 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
             debug_port = get_available_port()
             co.set_argument(f'--remote-debugging-port={debug_port}')
-            co.set_user_data_path(os.path.join(os.getcwd(), 'chrome_user_data_ci'))
+            co.set_user_data_path(user_data_dir)
         else:
             co.auto_port(True)
             co.set_argument('--window-size=1920,1080')
             co.set_argument('--no-sandbox')
             co.set_argument('--disable-gpu')
             co.set_argument('--disable-dev-shm-usage')
-            co.set_user_data_path('./chrome_user_data')
+            co.set_user_data_path(user_data_dir)
 
         co.set_argument('--disable-cache')
         co.set_argument('--disable-application-cache')
@@ -243,7 +250,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            # ========== 以下为优化后的 token 提取部分（登录成功后） ==========
+            # ---------- 改进后的 token 提取部分（登录成功后） ----------
             print("等待登录成功后跳转...")
             token = None
             start_time = time.time()
@@ -261,7 +268,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                         try:
                             real_token = exchange_token_with_code(code)
                             print("✅ 成功换取访问令牌")
-                            # 清理临时文件
+                            # 清理临时验证码图片
                             if os.path.exists(file_path):
                                 os.remove(file_path)
                                 try:
@@ -303,7 +310,6 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 time.sleep(0.5)
 
             raise Exception("获取 token 超时，未获取到有效的授权码或访问令牌")
-            # ========== token 提取部分结束 ==========
 
         except Exception as e:
             print(f"第 {attempt} 次尝试失败: {e}")
@@ -323,6 +329,13 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 dp.quit()
             except:
                 pass
+            # ========== 新增：每次运行结束后清除浏览器数据目录 ==========
+            if os.path.exists(user_data_dir):
+                try:
+                    shutil.rmtree(user_data_dir)
+                    print(f"✅ 已清除浏览器数据目录: {user_data_dir}")
+                except Exception as e:
+                    print(f"⚠️ 清除浏览器数据目录失败: {e}")
 
     raise Exception(f"登录失败，已重试 {max_retries} 次。")
 
