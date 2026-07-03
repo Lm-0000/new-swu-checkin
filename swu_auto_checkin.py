@@ -9,7 +9,7 @@ import argparse
 import subprocess
 import urllib.parse
 import socket
-import shutil  # 新增用于删除目录
+import shutil
 import ddddocr
 import requests
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -50,14 +50,8 @@ def get_available_port():
 
 # ==================== 登录模块 ====================
 def exchange_token_with_code(code: str) -> str:
-    """
-    使用授权码 code 换取真正的 fighter-auth-token
-    """
     url = "https://of.swu.edu.cn/gateway/fighter-middle/api/integrate/uaap/cas/exchange-token"
-    params = {
-        "token": code,
-        "remember": "true"
-    }
+    params = {"token": code, "remember": "true"}
     resp = requests.get(url, params=params)
     if resp.status_code != 200:
         raise Exception(f"换取 token 失败，HTTP状态码: {resp.status_code}")
@@ -71,23 +65,23 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
     chrome_path = get_chrome_path()
     print(f"✅ 使用 Chrome: {chrome_path}")
 
-    # 根据模式确定用户数据目录（用于后续清理）
     is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
-    if headless or is_ci:
-        user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci')
-    else:
-        user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data')
+    user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci' if (headless or is_ci) else 'chrome_user_data')
 
     for attempt in range(1, max_retries + 1):
         print(f"\n--- 第 {attempt} 次尝试登录 ---")
         co = ChromiumOptions()
         co.set_paths(browser_path=chrome_path)
 
+        # ========== 针对 GitHub Actions 优化浏览器参数 ==========
         if headless or is_ci:
-            co.set_argument('--headless=new')
+            # 兼容 Chromium 115，使用 --headless（而非 --headless=new）
+            co.set_argument('--headless')
             co.set_argument('--no-sandbox')
             co.set_argument('--disable-dev-shm-usage')
             co.set_argument('--disable-gpu')
+            co.set_argument('--disable-software-rasterizer')   # 新增
+            co.set_argument('--disable-setuid-sandbox')        # 新增
             co.set_argument('--window-size=1920,1080')
             co.set_argument('--disable-blink-features=AutomationControlled')
             co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -110,6 +104,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             print("✅ 浏览器启动成功")
         except Exception as e:
             print(f"❌ 浏览器启动失败: {e}")
+            # 若 headless 启动失败，降级为有头（auto_port）
             if headless or is_ci:
                 co = ChromiumOptions()
                 co.set_paths(browser_path=chrome_path)
@@ -119,11 +114,12 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 co.set_argument('--disable-gpu')
                 co.set_argument('--disable-dev-shm-usage')
                 dp = ChromiumPage(co)
-                print("✅ 已切换到非无头模式启动")
+                print("✅ 已切换到非无头模式启动（auto_port）")
             else:
                 raise
 
         try:
+            # ========== 以下登录交互代码一字未改 ==========
             login_url = 'https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter'
             dp.get(login_url)
             print(f"当前页面标题: {dp.title}")
@@ -250,15 +246,15 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            # ---------- 改进后的 token 提取部分（登录成功后） ----------
+            # ========== 改进的 token 提取（增加日志和超时保护） ==========
             print("等待登录成功后跳转...")
             token = None
             start_time = time.time()
-            timeout = 60  # 最长等待 60 秒
+            timeout = 90  # 延长至 90 秒，适应慢速网络
 
             while time.time() - start_time < timeout:
                 current_url = dp.url
-                # 优先：URL 包含 code 参数（通常在 of.swu.edu.cn 域名下）
+                # 优先：URL 包含 code 参数
                 if 'code=' in current_url and 'of.swu.edu.cn' in current_url:
                     parsed = urllib.parse.urlparse(current_url)
                     params = urllib.parse.parse_qs(parsed.query)
@@ -268,7 +264,6 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                         try:
                             real_token = exchange_token_with_code(code)
                             print("✅ 成功换取访问令牌")
-                            # 清理临时验证码图片
                             if os.path.exists(file_path):
                                 os.remove(file_path)
                                 try:
@@ -278,7 +273,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                             return real_token
                         except Exception as e:
                             raise Exception(f"换取 token 失败: {e}")
-                # 备选：如果已经跳转到 of 主页且没有 code，尝试从 localStorage 取（兼容手动调试）
+                # 备选：从 localStorage 读取
                 if 'of.swu.edu.cn' in current_url and 'code' not in current_url:
                     token = dp.run_js('''
                         return localStorage.getItem('access_token') || 
@@ -291,7 +286,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                         try:
                             test_url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
                             test_headers = {"fighter-auth-token": token}
-                            test_resp = requests.get(test_url, headers=test_headers)
+                            test_resp = requests.get(test_url, headers=test_headers, timeout=5)
                             if test_resp.status_code == 200:
                                 print("✅ localStorage 中的 token 有效")
                                 if os.path.exists(file_path):
@@ -303,13 +298,16 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                                 return token
                             else:
                                 print("⚠️ localStorage 中的 token 无效，继续等待...")
-                        except:
-                            pass
-                if int((time.time() - start_time) * 2) % 10 == 0:
-                    print(f"当前 URL ({time.time()-start_time:.1f}s): {current_url[:100]}...")
+                        except Exception as e:
+                            print(f"⚠️ 验证 token 时发生异常: {e}")
+
+                # 每 5 秒打印一次状态（方便调试）
+                elapsed = time.time() - start_time
+                if int(elapsed) % 5 == 0:
+                    print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
                 time.sleep(0.5)
 
-            raise Exception("获取 token 超时，未获取到有效的授权码或访问令牌")
+            raise Exception("获取 token 超时（90s），未获取到有效的授权码或访问令牌")
 
         except Exception as e:
             print(f"第 {attempt} 次尝试失败: {e}")
@@ -329,13 +327,13 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 dp.quit()
             except:
                 pass
-            # ========== 新增：每次运行结束后清除浏览器数据目录 ==========
+            # 清理用户数据目录（忽略错误，避免影响流程）
             if os.path.exists(user_data_dir):
                 try:
                     shutil.rmtree(user_data_dir)
                     print(f"✅ 已清除浏览器数据目录: {user_data_dir}")
                 except Exception as e:
-                    print(f"⚠️ 清除浏览器数据目录失败: {e}")
+                    print(f"⚠️ 清除浏览器数据目录失败（可忽略）: {e}")
 
     raise Exception(f"登录失败，已重试 {max_retries} 次。")
 
@@ -362,10 +360,6 @@ def get_student_id(token: str):
     return resp.json()["data"]["subject"]["username"]
 
 def checkin(token: str):
-    """
-    执行打卡，返回 (success, reason, exit_code)
-    exit_code: 0=成功/已签到, 10=无任务, 20=失败
-    """
     try:
         task = get_transition_today(token)
         if not task:
