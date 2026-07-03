@@ -47,7 +47,7 @@ def get_available_port():
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-# ==================== 登录模块 ====================
+# ==================== 登录模块（仅优化 token 提取部分） ====================
 def exchange_token_with_code(code: str) -> str:
     """
     使用授权码 code 换取真正的 fighter-auth-token
@@ -243,10 +243,13 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            # ---------- 核心：从回调 URL 提取 code 并交换 token ----------
+            # ========== 以下为优化后的 token 提取部分（登录成功后） ==========
             print("等待登录成功后跳转...")
-            for i in range(60):  # 最多等待30秒
-                time.sleep(0.5)
+            token = None
+            start_time = time.time()
+            timeout = 60  # 最长等待 60 秒
+
+            while time.time() - start_time < timeout:
                 current_url = dp.url
                 # 优先：URL 包含 code 参数（通常在 of.swu.edu.cn 域名下）
                 if 'code=' in current_url and 'of.swu.edu.cn' in current_url:
@@ -268,7 +271,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                             return real_token
                         except Exception as e:
                             raise Exception(f"换取 token 失败: {e}")
-                # 备选：如果已经跳转到 of 主页且没有 code，尝试从 localStorage 取（用于兼容手动调试）
+                # 备选：如果已经跳转到 of 主页且没有 code，尝试从 localStorage 取（兼容手动调试）
                 if 'of.swu.edu.cn' in current_url and 'code' not in current_url:
                     token = dp.run_js('''
                         return localStorage.getItem('access_token') || 
@@ -295,10 +298,12 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                                 print("⚠️ localStorage 中的 token 无效，继续等待...")
                         except:
                             pass
-                if i % 10 == 0:
-                    print(f"当前 URL ({i*0.5}s): {current_url[:100]}...")
+                if int((time.time() - start_time) * 2) % 10 == 0:
+                    print(f"当前 URL ({time.time()-start_time:.1f}s): {current_url[:100]}...")
+                time.sleep(0.5)
 
             raise Exception("获取 token 超时，未获取到有效的授权码或访问令牌")
+            # ========== token 提取部分结束 ==========
 
         except Exception as e:
             print(f"第 {attempt} 次尝试失败: {e}")
@@ -321,7 +326,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
 
     raise Exception(f"登录失败，已重试 {max_retries} 次。")
 
-# ==================== 打卡模块 ====================
+# ==================== 打卡模块（未改动） ====================
 def get_transition_today(token: str):
     """查询今日打卡任务"""
     url = "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday"
@@ -349,20 +354,17 @@ def checkin(token: str):
     exit_code: 0=成功/已签到, 10=无任务, 20=失败
     """
     try:
-        # 1. 获取今日任务
         task = get_transition_today(token)
         if not task:
             msg = "今日无打卡任务"
             print(f"ℹ️ {msg}")
-            return True, msg, 10   # 无任务视为正常
+            return True, msg, 10
 
-        # 2. 检查是否已签到
         if task.get("qdzt") == "已签到":
             msg = "今日已签到，无需重复"
             print(f"✅ {msg}")
-            return True, msg, 0    # 已签到视为成功
+            return True, msg, 0
 
-        # 3. 未签到，执行打卡
         student_id = get_student_id(token)
         print(f"当前用户学号: {student_id}")
 
@@ -403,7 +405,7 @@ def checkin(token: str):
         print(f"❌ {msg}")
         return False, msg, 20
 
-# ==================== 主程序 ====================
+# ==================== 主程序（未改动） ====================
 def main():
     parser = argparse.ArgumentParser(description='西南大学自动打卡（含自动登录）')
     parser.add_argument('--no-headless', action='store_true', help='禁用无头模式（显示浏览器）')
@@ -434,11 +436,9 @@ def main():
             print(f"❌ Token 无效或已过期: {e}")
             sys.exit(1)
 
-    # 执行打卡
     print("\n--- 开始打卡 ---")
     success, reason, exit_code = checkin(token)
     if success:
-        # 所有成功情况（包括已签到、无任务）都返回0，但日志已区分
         print(f"✅ 打卡流程完成：{reason}")
         sys.exit(0)
     else:
