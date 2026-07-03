@@ -73,15 +73,15 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
         co = ChromiumOptions()
         co.set_paths(browser_path=chrome_path)
 
-        # ========== 针对 GitHub Actions 优化浏览器参数 ==========
         if headless or is_ci:
-            # 兼容 Chromium 115，使用 --headless（而非 --headless=new）
+            # 使用 --headless（兼容 Chromium 115），增加稳定性参数
             co.set_argument('--headless')
             co.set_argument('--no-sandbox')
             co.set_argument('--disable-dev-shm-usage')
             co.set_argument('--disable-gpu')
-            co.set_argument('--disable-software-rasterizer')   # 新增
-            co.set_argument('--disable-setuid-sandbox')        # 新增
+            co.set_argument('--disable-software-rasterizer')
+            co.set_argument('--disable-setuid-sandbox')
+            co.set_argument('--disable-features=HttpsUpgrades')  # 防止自动升级 HTTPS 影响重定向
             co.set_argument('--window-size=1920,1080')
             co.set_argument('--disable-blink-features=AutomationControlled')
             co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -104,7 +104,6 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             print("✅ 浏览器启动成功")
         except Exception as e:
             print(f"❌ 浏览器启动失败: {e}")
-            # 若 headless 启动失败，降级为有头（auto_port）
             if headless or is_ci:
                 co = ChromiumOptions()
                 co.set_paths(browser_path=chrome_path)
@@ -246,11 +245,13 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            # ========== 改进的 token 提取（增加日志和超时保护） ==========
+            # ========== 改进的 token 提取（增加中间页处理） ==========
             print("等待登录成功后跳转...")
             token = None
             start_time = time.time()
-            timeout = 90  # 延长至 90 秒，适应慢速网络
+            timeout = 90
+            callback_encountered = False
+            callback_time = None
 
             while time.time() - start_time < timeout:
                 current_url = dp.url
@@ -273,7 +274,22 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                             return real_token
                         except Exception as e:
                             raise Exception(f"换取 token 失败: {e}")
-                # 备选：从 localStorage 读取
+
+                # 如果卡在 callbackAuthorize 中间页，等待 10 秒后强制跳转到 of 首页
+                if 'callbackAuthorize' in current_url and 'ticket=' in current_url:
+                    if not callback_encountered:
+                        callback_encountered = True
+                        callback_time = time.time()
+                        print("⏳ 检测到中间页（callbackAuthorize），等待自动重定向...")
+                    # 如果等待超过 10 秒，手动跳转
+                    if time.time() - callback_time > 10:
+                        print("⏳ 中间页停留过久，主动跳转至 of.swu.edu.cn 以获取 token...")
+                        dp.get('https://of.swu.edu.cn')
+                        dp.wait.load_complete(timeout=10)
+                        # 继续循环，尝试从 localStorage 读取 token
+                        continue
+
+                # 如果已经跳转到 of 首页，尝试从 localStorage 读取
                 if 'of.swu.edu.cn' in current_url and 'code' not in current_url:
                     token = dp.run_js('''
                         return localStorage.getItem('access_token') || 
@@ -301,7 +317,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                         except Exception as e:
                             print(f"⚠️ 验证 token 时发生异常: {e}")
 
-                # 每 5 秒打印一次状态（方便调试）
+                # 每 5 秒打印一次状态
                 elapsed = time.time() - start_time
                 if int(elapsed) % 5 == 0:
                     print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
@@ -327,7 +343,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 dp.quit()
             except:
                 pass
-            # 清理用户数据目录（忽略错误，避免影响流程）
+            # 清理用户数据目录
             if os.path.exists(user_data_dir):
                 try:
                     shutil.rmtree(user_data_dir)
