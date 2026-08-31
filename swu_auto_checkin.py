@@ -57,7 +57,7 @@ def get_available_port():
         return s.getsockname()[1]
 
 # ==================== 登录模块 ====================
-def get_swu_token(username: str, password: str, headless: bool = False, max_retries: int = 3):
+def get_swu_token(username: str, password: str, headless: bool = False, max_retries: int = 5):
     """
     自动登录西南大学统一认证，从 localStorage 获取 fighter-auth-token
     - 登录交互代码（表单/验证码/点击）完全保留原样
