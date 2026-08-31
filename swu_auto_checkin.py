@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+西南大学自动打卡脚本（最终版）
+- 自动登录并仅从 localStorage/sessionStorage 获取 token
+- 支持 GitHub Actions 无头模式
+- 每次运行自动清除浏览器数据，保证环境干净
+- 登录交互代码完全保留原样，未作任何修改
+"""
+
 import os
 import sys
 import time
@@ -49,20 +57,12 @@ def get_available_port():
         return s.getsockname()[1]
 
 # ==================== 登录模块 ====================
-# 注意：exchange_token_with_code 不再使用，但保留未删（可移除）
-def exchange_token_with_code(code: str) -> str:
-    url = "https://of.swu.edu.cn/gateway/fighter-middle/api/integrate/uaap/cas/exchange-token"
-    params = {"token": code, "remember": "true"}
-    resp = requests.get(url, params=params)
-    if resp.status_code != 200:
-        raise Exception(f"换取 token 失败，HTTP状态码: {resp.status_code}")
-    data = resp.json()
-    if "data" in data and data["data"]:
-        return data["data"]
-    else:
-        raise Exception(f"换取 token 失败: {data.get('msg', '未知错误')}")
-
 def get_swu_token(username: str, password: str, headless: bool = False, max_retries: int = 3):
+    """
+    自动登录西南大学统一认证，从 localStorage 获取 fighter-auth-token
+    - 登录交互代码（表单/验证码/点击）完全保留原样
+    - 仅 token 提取部分改为读取 localStorage 并验证
+    """
     chrome_path = get_chrome_path()
     print(f"✅ 使用 Chrome: {chrome_path}")
 
@@ -75,13 +75,14 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
         co.set_paths(browser_path=chrome_path)
 
         if headless or is_ci:
+            # 兼容 Chromium 115 的无头参数
             co.set_argument('--headless')
             co.set_argument('--no-sandbox')
             co.set_argument('--disable-dev-shm-usage')
             co.set_argument('--disable-gpu')
             co.set_argument('--disable-software-rasterizer')
             co.set_argument('--disable-setuid-sandbox')
-            co.set_argument('--disable-features=HttpsUpgrades')
+            co.set_argument('--disable-features=HttpsUpgrades')  # 防止 HTTPS 升级影响重定向
             co.set_argument('--window-size=1920,1080')
             co.set_argument('--disable-blink-features=AutomationControlled')
             co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -105,6 +106,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
         except Exception as e:
             print(f"❌ 浏览器启动失败: {e}")
             if headless or is_ci:
+                # 降级为非无头模式（auto_port）
                 co = ChromiumOptions()
                 co.set_paths(browser_path=chrome_path)
                 co.auto_port(True)
@@ -118,7 +120,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 raise
 
         try:
-            # ========== 登录交互（完全保留） ==========
+            # ==================== 登录交互（完全保留原样） ====================
             login_url = 'https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter'
             dp.get(login_url)
             print(f"当前页面标题: {dp.title}")
@@ -245,7 +247,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            # ========== 仅从 localStorage/sessionStorage 获取 token ==========
+            # ==================== token 提取（仅从 localStorage / sessionStorage） ====================
             print("等待登录成功后跳转...")
             token = None
             start_time = time.time()
@@ -256,7 +258,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             while time.time() - start_time < timeout:
                 current_url = dp.url
 
-                # 检测中间页，若停留超过 10 秒则强制跳转到 of 首页
+                # 检测中间页（callbackAuthorize），停留超过10秒则强制跳转
                 if 'callbackAuthorize' in current_url and 'ticket=' in current_url:
                     if not callback_encountered:
                         callback_encountered = True
@@ -265,7 +267,6 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     if time.time() - callback_time > 10:
                         print("⏳ 中间页停留过久，主动跳转至 of.swu.edu.cn 以获取 token...")
                         dp.get('https://of.swu.edu.cn')
-                        # 跳转后继续循环，等待页面加载并读取存储
                         continue
 
                 # 一旦进入 of.swu.edu.cn（且不含 code），立即从存储读取 token
@@ -284,7 +285,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                             test_resp = requests.get(test_url, headers=test_headers, timeout=5)
                             if test_resp.status_code == 200:
                                 print("✅ localStorage 中的 token 有效")
-                                # 清理临时文件
+                                # 清理临时验证码图片
                                 if os.path.exists(file_path):
                                     os.remove(file_path)
                                     try:
@@ -323,6 +324,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 dp.quit()
             except:
                 pass
+            # 清理用户数据目录（确保下次运行环境干净）
             if os.path.exists(user_data_dir):
                 try:
                     shutil.rmtree(user_data_dir)
@@ -405,7 +407,7 @@ def checkin(token: str):
         print(f"❌ {msg}")
         return False, msg, 20
 
-# ==================== 主程序（未改动） ====================
+# ==================== 主程序 ====================
 def main():
     parser = argparse.ArgumentParser(description='西南大学自动打卡（含自动登录）')
     parser.add_argument('--no-headless', action='store_true', help='禁用无头模式（显示浏览器）')
