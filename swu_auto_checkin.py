@@ -15,7 +15,6 @@ import time
 import json
 import argparse
 import subprocess
-import urllib.parse
 import socket
 import shutil
 import ddddocr
@@ -249,25 +248,11 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
 
             # ==================== token 提取（仅从 localStorage / sessionStorage） ====================
             print("等待登录成功后跳转...")
-            token = None
             start_time = time.time()
-            timeout = 30
-            callback_encountered = False
-            callback_time = None
+            timeout = 20
 
             while time.time() - start_time < timeout:
                 current_url = dp.url
-
-                # 检测中间页（callbackAuthorize），停留超过10秒则强制跳转
-                if 'callbackAuthorize' in current_url and 'ticket=' in current_url:
-                    if not callback_encountered:
-                        callback_encountered = True
-                        callback_time = time.time()
-                        print("⏳ 检测到中间页（callbackAuthorize），等待自动重定向...")
-                    if time.time() - callback_time > 10:
-                        print("⏳ 中间页停留过久，主动跳转至 of.swu.edu.cn 以获取 token...")
-                        dp.get('https://of.swu.edu.cn')
-                        continue
 
                 # 一旦进入 of.swu.edu.cn（且不含 code），立即从存储读取 token
                 if 'of.swu.edu.cn' in current_url and 'code' not in current_url:
@@ -304,7 +289,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
                 time.sleep(0.5)
 
-            raise Exception("获取 token 超时（30s），未从 localStorage/sessionStorage 获取到有效 token")
+            raise Exception("获取 token 超时（20s），未从 localStorage/sessionStorage 获取到有效 token")
 
         except Exception as e:
             print(f"第 {attempt} 次尝试失败: {e}")
