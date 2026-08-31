@@ -49,6 +49,7 @@ def get_available_port():
         return s.getsockname()[1]
 
 # ==================== 登录模块 ====================
+# 注意：exchange_token_with_code 不再使用，但保留未删（可移除）
 def exchange_token_with_code(code: str) -> str:
     url = "https://of.swu.edu.cn/gateway/fighter-middle/api/integrate/uaap/cas/exchange-token"
     params = {"token": code, "remember": "true"}
@@ -244,7 +245,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            # ========== token 提取（已修复错误） ==========
+            # ========== 仅从 localStorage/sessionStorage 获取 token ==========
             print("等待登录成功后跳转...")
             token = None
             start_time = time.time()
@@ -254,27 +255,8 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
 
             while time.time() - start_time < timeout:
                 current_url = dp.url
-                # 优先：URL 包含 code 参数
-                if 'code=' in current_url and 'of.swu.edu.cn' in current_url:
-                    parsed = urllib.parse.urlparse(current_url)
-                    params = urllib.parse.parse_qs(parsed.query)
-                    if 'code' in params:
-                        code = params['code'][0]
-                        print(f"获取到授权码 code: {code[:10]}...")
-                        try:
-                            real_token = exchange_token_with_code(code)
-                            print("✅ 成功换取访问令牌")
-                            if os.path.exists(file_path):
-                                os.remove(file_path)
-                                try:
-                                    os.rmdir('images')
-                                except:
-                                    pass
-                            return real_token
-                        except Exception as e:
-                            raise Exception(f"换取 token 失败: {e}")
 
-                # 检测中间页
+                # 检测中间页，若停留超过 10 秒则强制跳转到 of 首页
                 if 'callbackAuthorize' in current_url and 'ticket=' in current_url:
                     if not callback_encountered:
                         callback_encountered = True
@@ -283,10 +265,10 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     if time.time() - callback_time > 10:
                         print("⏳ 中间页停留过久，主动跳转至 of.swu.edu.cn 以获取 token...")
                         dp.get('https://of.swu.edu.cn')
-                        # 不再使用 dp.wait.load_complete，直接 continue 让循环检测 URL 和 localStorage
+                        # 跳转后继续循环，等待页面加载并读取存储
                         continue
 
-                # 如果已经跳转到 of 首页，尝试从 localStorage 读取
+                # 一旦进入 of.swu.edu.cn（且不含 code），立即从存储读取 token
                 if 'of.swu.edu.cn' in current_url and 'code' not in current_url:
                     token = dp.run_js('''
                         return localStorage.getItem('access_token') || 
@@ -302,6 +284,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                             test_resp = requests.get(test_url, headers=test_headers, timeout=5)
                             if test_resp.status_code == 200:
                                 print("✅ localStorage 中的 token 有效")
+                                # 清理临时文件
                                 if os.path.exists(file_path):
                                     os.remove(file_path)
                                     try:
@@ -314,12 +297,13 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                         except Exception as e:
                             print(f"⚠️ 验证 token 时发生异常: {e}")
 
+                # 每 5 秒打印一次状态
                 elapsed = time.time() - start_time
                 if int(elapsed) % 5 == 0:
                     print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
                 time.sleep(0.5)
 
-            raise Exception("获取 token 超时（90s），未获取到有效的授权码或访问令牌")
+            raise Exception("获取 token 超时（90s），未从 localStorage/sessionStorage 获取到有效 token")
 
         except Exception as e:
             print(f"第 {attempt} 次尝试失败: {e}")
