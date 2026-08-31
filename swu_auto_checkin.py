@@ -74,14 +74,13 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
         co.set_paths(browser_path=chrome_path)
 
         if headless or is_ci:
-            # 使用 --headless（兼容 Chromium 115），增加稳定性参数
             co.set_argument('--headless')
             co.set_argument('--no-sandbox')
             co.set_argument('--disable-dev-shm-usage')
             co.set_argument('--disable-gpu')
             co.set_argument('--disable-software-rasterizer')
             co.set_argument('--disable-setuid-sandbox')
-            co.set_argument('--disable-features=HttpsUpgrades')  # 防止自动升级 HTTPS 影响重定向
+            co.set_argument('--disable-features=HttpsUpgrades')
             co.set_argument('--window-size=1920,1080')
             co.set_argument('--disable-blink-features=AutomationControlled')
             co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -118,7 +117,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 raise
 
         try:
-            # ========== 以下登录交互代码一字未改 ==========
+            # ========== 登录交互（完全保留） ==========
             login_url = 'https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter'
             dp.get(login_url)
             print(f"当前页面标题: {dp.title}")
@@ -245,7 +244,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            # ========== 改进的 token 提取（增加中间页处理） ==========
+            # ========== token 提取（已修复错误） ==========
             print("等待登录成功后跳转...")
             token = None
             start_time = time.time()
@@ -275,18 +274,16 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                         except Exception as e:
                             raise Exception(f"换取 token 失败: {e}")
 
-                # 如果卡在 callbackAuthorize 中间页，等待 10 秒后强制跳转到 of 首页
+                # 检测中间页
                 if 'callbackAuthorize' in current_url and 'ticket=' in current_url:
                     if not callback_encountered:
                         callback_encountered = True
                         callback_time = time.time()
                         print("⏳ 检测到中间页（callbackAuthorize），等待自动重定向...")
-                    # 如果等待超过 10 秒，手动跳转
                     if time.time() - callback_time > 10:
                         print("⏳ 中间页停留过久，主动跳转至 of.swu.edu.cn 以获取 token...")
                         dp.get('https://of.swu.edu.cn')
-                        dp.wait.load_complete(timeout=10)
-                        # 继续循环，尝试从 localStorage 读取 token
+                        # 不再使用 dp.wait.load_complete，直接 continue 让循环检测 URL 和 localStorage
                         continue
 
                 # 如果已经跳转到 of 首页，尝试从 localStorage 读取
@@ -317,7 +314,6 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                         except Exception as e:
                             print(f"⚠️ 验证 token 时发生异常: {e}")
 
-                # 每 5 秒打印一次状态
                 elapsed = time.time() - start_time
                 if int(elapsed) % 5 == 0:
                     print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
@@ -343,7 +339,6 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 dp.quit()
             except:
                 pass
-            # 清理用户数据目录
             if os.path.exists(user_data_dir):
                 try:
                     shutil.rmtree(user_data_dir)
@@ -355,7 +350,6 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
 
 # ==================== 打卡模块（未改动） ====================
 def get_transition_today(token: str):
-    """查询今日打卡任务"""
     url = "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday"
     headers = {"fighter-auth-token": token}
     data = {"pageNum": 1, "pageSize": 1}
@@ -367,7 +361,6 @@ def get_transition_today(token: str):
     return records[0] if records else None
 
 def get_student_id(token: str):
-    """获取当前登录用户的学号"""
     url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
     headers = {"fighter-auth-token": token}
     resp = requests.get(url, headers=headers)
