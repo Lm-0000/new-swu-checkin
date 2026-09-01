@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-西南大学自动打卡脚本（最终版）
-- 自动登录并仅从 localStorage 获取 access_token（优化版）
+西南大学自动打卡脚本（最终版 - 稳定性与速度优化）
+- 自动登录并仅从 localStorage 获取 access_token
 - 支持 GitHub Actions 无头模式
 - 每次运行自动清除浏览器数据，保证环境干净
 - 登录交互代码完全保留原样，未作任何修改
@@ -60,7 +60,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
     """
     自动登录西南大学统一认证，从 localStorage 获取 access_token
     - 登录交互代码（表单/验证码/点击）完全保留原样
-    - token 提取部分优化为仅读取 localStorage 中的 access_token
+    - token 提取部分经过优化，提高速度和稳定性
     """
     chrome_path = get_chrome_path()
     print(f"✅ 使用 Chrome: {chrome_path}")
@@ -246,18 +246,24 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            # ==================== token 提取（优化版：仅从 localStorage 获取 access_token） ====================
+            # ==================== token 提取（优化版：高稳定、高速度） ====================
             print("等待登录成功后跳转...")
             start_time = time.time()
             timeout = 20
+            wait_interval = 0.2           # 短轮询间隔，提高响应速度
+            entered_target = False        # 标记是否已进入目标域
+            token = None
 
             while time.time() - start_time < timeout:
                 current_url = dp.url
 
-                # 一旦进入 of.swu.edu.cn 域，立即尝试读取 access_token
+                # 一旦进入 of.swu.edu.cn，立即尝试读取
                 if 'of.swu.edu.cn' in current_url:
-                    # 给浏览器一点时间将 token 写入 localStorage（约 0.5 秒）
-                    time.sleep(0.5)
+                    if not entered_target:
+                        print("✅ 已进入目标域，开始轮询 localStorage...")
+                        entered_target = True
+
+                    # 直接读取，不预先 sleep
                     token = dp.run_js('return localStorage.getItem("access_token");')
                     if token:
                         print("✅ 从 localStorage 获取 token 成功，尝试验证有效性...")
@@ -277,14 +283,23 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                                 return token
                             else:
                                 print("⚠️ localStorage 中的 token 无效，继续等待...")
+                                token = None  # 置空，避免重复验证
                         except Exception as e:
                             print(f"⚠️ 验证 token 时发生异常: {e}")
+                            token = None
+                    # 如果没有 token 或验证失败，继续循环（短暂 sleep 后重试）
+                else:
+                    # 未进入目标域，等待稍长时间再检查
+                    if entered_target:
+                        # 如果之前进入过但 URL 变了（极少情况），重置标记
+                        entered_target = False
 
                 # 每 5 秒打印一次状态
                 elapsed = time.time() - start_time
                 if int(elapsed) % 5 == 0:
                     print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
-                time.sleep(0.5)
+
+                time.sleep(wait_interval)
 
             raise Exception("获取 token 超时（20s），未从 localStorage 获取到有效 access_token")
 
