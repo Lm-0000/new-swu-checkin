@@ -3,7 +3,7 @@
 
 """
 西南大学自动打卡脚本（最终版）
-- 自动登录并仅从 localStorage/sessionStorage 获取 token
+- 自动登录并仅从 localStorage 获取 access_token（优化版）
 - 支持 GitHub Actions 无头模式
 - 每次运行自动清除浏览器数据，保证环境干净
 - 登录交互代码完全保留原样，未作任何修改
@@ -58,9 +58,9 @@ def get_available_port():
 # ==================== 登录模块 ====================
 def get_swu_token(username: str, password: str, headless: bool = False, max_retries: int = 5):
     """
-    自动登录西南大学统一认证，从 localStorage 获取 fighter-auth-token
+    自动登录西南大学统一认证，从 localStorage 获取 access_token
     - 登录交互代码（表单/验证码/点击）完全保留原样
-    - 仅 token 提取部分改为读取 localStorage 并验证
+    - token 提取部分优化为仅读取 localStorage 中的 access_token
     """
     chrome_path = get_chrome_path()
     print(f"✅ 使用 Chrome: {chrome_path}")
@@ -246,7 +246,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⚠️ 错误信息: {e.text}")
                 raise Exception(f"登录失败: {error_msgs[0].text}")
 
-            # ==================== token 提取（仅从 localStorage / sessionStorage） ====================
+            # ==================== token 提取（优化版：仅从 localStorage 获取 access_token） ====================
             print("等待登录成功后跳转...")
             start_time = time.time()
             timeout = 20
@@ -254,16 +254,13 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             while time.time() - start_time < timeout:
                 current_url = dp.url
 
-                # 一旦进入 of.swu.edu.cn（且不含 code），立即从存储读取 token
-                if 'of.swu.edu.cn' in current_url and 'code' not in current_url:
-                    token = dp.run_js('''
-                        return localStorage.getItem('access_token') || 
-                               localStorage.getItem('token') ||
-                               sessionStorage.getItem('access_token') ||
-                               sessionStorage.getItem('token');
-                    ''')
+                # 一旦进入 of.swu.edu.cn 域，立即尝试读取 access_token
+                if 'of.swu.edu.cn' in current_url:
+                    # 给浏览器一点时间将 token 写入 localStorage（约 0.5 秒）
+                    time.sleep(0.5)
+                    token = dp.run_js('return localStorage.getItem("access_token");')
                     if token:
-                        print("✅ 从 localStorage/sessionStorage 获取 token 成功，尝试验证有效性...")
+                        print("✅ 从 localStorage 获取 token 成功，尝试验证有效性...")
                         try:
                             test_url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
                             test_headers = {"fighter-auth-token": token}
@@ -289,7 +286,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
                 time.sleep(0.5)
 
-            raise Exception("获取 token 超时（20s），未从 localStorage/sessionStorage 获取到有效 token")
+            raise Exception("获取 token 超时（20s），未从 localStorage 获取到有效 access_token")
 
         except Exception as e:
             print(f"第 {attempt} 次尝试失败: {e}")
