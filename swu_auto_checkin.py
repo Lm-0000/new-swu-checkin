@@ -232,7 +232,7 @@ def login_and_get_page(username: str, password: str, headless: bool = False, max
             page.actions.move_to(login_btn).click().wait(0.5)
             print("✅ 已点击登录按钮")
             time.sleep(1)
-            error_msgs = dp.eles('.error, #err, .msg-error, .alert-danger', timeout=1)
+            error_msgs = page.eles('.error, #err, .msg-error, .alert-danger', timeout=1)
             if error_msgs:
                 for e in error_msgs:
                     print(f"⚠️ 错误信息: {e.text}")
@@ -240,7 +240,7 @@ def login_and_get_page(username: str, password: str, headless: bool = False, max
 
             # ==================== token 提取（优化版：高稳定、高速度） ====================
             time.sleep(0.5)
-            dp.get(login_url)
+            page.get(login_url)
             time.sleep(2)
             print("等待登录成功后跳转...")
             start_time = time.time()
