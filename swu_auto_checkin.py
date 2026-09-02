@@ -132,6 +132,12 @@ def login_and_get_page(username: str, password: str, headless: bool = False, max
                 print(f"跳转后标题: {page.title}")
                 print(f"跳转后URL: {page.url}")
 
+            if 'Login' not in page.url:
+                print("未进入登录页，尝试直接访问基础登录页...")
+                page.get('https://idm.swu.edu.cn/am/UI/Login')
+                time.sleep(2)
+                print(f"基础登录页URL: {page.url}")
+
             print("等待登录表单加载...")
             time.sleep(1)
 
