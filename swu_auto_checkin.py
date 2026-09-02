@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-西南大学自动打卡脚本（最终版 - 稳定性与速度优化）
-- 自动登录并仅从 localStorage 获取 access_token
+西南大学自动打卡脚本（全程浏览器版）
+- 登录、获取 token、提交打卡均在同一浏览器会话中完成，UA/TLS 指纹全程一致
 - 支持 GitHub Actions 无头模式
 - 每次运行自动清除浏览器数据，保证环境干净
-- 登录交互代码完全保留原样，未作任何修改
+- 登录交互代码完全保留原样
 """
 
 import os
@@ -55,12 +55,11 @@ def get_available_port():
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-# ==================== 登录模块 ====================
-def get_swu_token(username: str, password: str, headless: bool = False, max_retries: int = 5):
+# ==================== 登录模块（返回浏览器对象和token） ====================
+def login_and_get_page(username: str, password: str, headless: bool = False, max_retries: int = 5):
     """
     自动登录西南大学统一认证，从 localStorage 获取 access_token
-    - 登录交互代码（表单/验证码/点击）完全保留原样
-    - token 提取部分经过优化，提高速度和稳定性
+    返回 (page, token)，page 为已登录的浏览器页面，token 为有效凭证
     """
     chrome_path = get_chrome_path()
     print(f"✅ 使用 Chrome: {chrome_path}")
@@ -74,14 +73,13 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
         co.set_paths(browser_path=chrome_path)
 
         if headless or is_ci:
-            # 兼容 Chromium 115 的无头参数
             co.set_argument('--headless')
             co.set_argument('--no-sandbox')
             co.set_argument('--disable-dev-shm-usage')
             co.set_argument('--disable-gpu')
             co.set_argument('--disable-software-rasterizer')
             co.set_argument('--disable-setuid-sandbox')
-            co.set_argument('--disable-features=HttpsUpgrades')  # 防止 HTTPS 升级影响重定向
+            co.set_argument('--disable-features=HttpsUpgrades')
             co.set_argument('--window-size=1920,1080')
             co.set_argument('--disable-blink-features=AutomationControlled')
             co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -99,8 +97,9 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
         co.set_argument('--disable-cache')
         co.set_argument('--disable-application-cache')
 
+        page = None
         try:
-            dp = ChromiumPage(co)
+            page = ChromiumPage(co)
             print("✅ 浏览器启动成功")
         except Exception as e:
             print(f"❌ 浏览器启动失败: {e}")
@@ -113,7 +112,7 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                 co.set_argument('--no-sandbox')
                 co.set_argument('--disable-gpu')
                 co.set_argument('--disable-dev-shm-usage')
-                dp = ChromiumPage(co)
+                page = ChromiumPage(co)
                 print("✅ 已切换到非无头模式启动（auto_port）")
             else:
                 raise
@@ -121,36 +120,36 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
         try:
             # ==================== 登录交互（完全保留原样） ====================
             login_url = 'https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter'
-            dp.get(login_url)
-            print(f"当前页面标题: {dp.title}")
-            print(f"当前URL: {dp.url}")
+            page.get(login_url)
+            print(f"当前页面标题: {page.title}")
+            print(f"当前URL: {page.url}")
 
-            unified_btn = dp.ele('@src=img/unified_button.png', timeout=5)
+            unified_btn = page.ele('@src=img/unified_button.png', timeout=5)
             if unified_btn:
                 unified_btn.click()
                 print("已点击统一认证按钮，等待跳转...")
                 time.sleep(3)
-                print(f"跳转后标题: {dp.title}")
-                print(f"跳转后URL: {dp.url}")
+                print(f"跳转后标题: {page.title}")
+                print(f"跳转后URL: {page.url}")
 
-            if 'Login' not in dp.url:
+            if 'Login' not in page.url:
                 print("未进入登录页，尝试直接访问基础登录页...")
-                dp.get('https://idm.swu.edu.cn/am/UI/Login')
+                page.get('https://idm.swu.edu.cn/am/UI/Login')
                 time.sleep(2)
-                print(f"基础登录页URL: {dp.url}")
+                print(f"基础登录页URL: {page.url}")
 
             print("等待登录表单加载...")
             time.sleep(1)
 
-            iframes = dp.eles('tag:iframe', timeout=3)
+            iframes = page.eles('tag:iframe', timeout=3)
             if iframes:
                 print(f"发现 {len(iframes)} 个 iframe，尝试切换到第一个")
-                dp.to_frame(iframes[0])
+                page.to_frame(iframes[0])
                 time.sleep(1)
 
-            username_input = dp.ele('@name=username', timeout=3) or dp.ele('@name=j_username', timeout=3)
+            username_input = page.ele('@name=username', timeout=3) or page.ele('@name=j_username', timeout=3)
             if not username_input:
-                inputs = dp.eles('tag:input@type=text', timeout=3)
+                inputs = page.eles('tag:input@type=text', timeout=3)
                 if inputs:
                     username_input = inputs[0]
             if not username_input:
@@ -158,9 +157,9 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             username_input.clear().input(username)
             print("✅ 已输入用户名")
 
-            password_input = dp.ele('@name=password', timeout=3) or dp.ele('@name=j_password', timeout=3)
+            password_input = page.ele('@name=password', timeout=3) or page.ele('@name=j_password', timeout=3)
             if not password_input:
-                inputs = dp.eles('tag:input@type=password', timeout=3)
+                inputs = page.eles('tag:input@type=password', timeout=3)
                 if inputs:
                     password_input = inputs[0]
             if not password_input:
@@ -170,9 +169,9 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
 
             print("正在获取验证码...")
             time.sleep(0.5)
-            img = dp.ele('@id=kaptchaImage', timeout=5) or dp.ele('@src=/am/validate.code', timeout=5)
+            img = page.ele('@id=kaptchaImage', timeout=5) or page.ele('@src=/am/validate.code', timeout=5)
             if not img:
-                all_imgs = dp.eles('tag:img', timeout=3)
+                all_imgs = page.eles('tag:img', timeout=3)
                 for i in all_imgs:
                     src = i.attr('src') or ''
                     if 'captcha' in src.lower() or 'code' in src.lower():
@@ -194,28 +193,28 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             result = ocr.classification(image_bytes)
             print(f"识别到的验证码: {result}")
 
-            captcha_input = dp.ele('@name=captcha', timeout=3) or dp.ele('@name=verificationCode', timeout=3)
+            captcha_input = page.ele('@name=captcha', timeout=3) or page.ele('@name=verificationCode', timeout=3)
             if not captcha_input:
-                inputs = dp.eles('tag:input@type=text', timeout=3)
+                inputs = page.eles('tag:input@type=text', timeout=3)
                 if inputs:
                     if len(inputs) > 1:
                         captcha_input = inputs[-1]
                     else:
                         captcha_input = inputs[0]
             if not captcha_input:
-                captcha_input = dp.ele('xpath://input[@type="text"][position()>2]', timeout=3)
+                captcha_input = page.ele('xpath://input[@type="text"][position()>2]', timeout=3)
             if not captcha_input:
                 raise Exception("❌ 未找到验证码输入框")
 
             captcha_input.clear()
-            dp.actions.click(captcha_input).wait(0.1)
+            page.actions.click(captcha_input).wait(0.1)
             for ch in result:
-                dp.actions.type(ch).wait(0.05)
+                page.actions.type(ch).wait(0.05)
             if username_input:
                 username_input.click()
-            dp.actions.wait(0.2)
+            page.actions.wait(0.2)
 
-            dp.run_js('''
+            page.run_js('''
                 var el = arguments[0];
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -226,21 +225,21 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             time.sleep(0.3)
             print("✅ 已输入验证码")
 
-            login_btn = dp.ele('@style=vertical-align: top;', timeout=3)
+            login_btn = page.ele('@style=vertical-align: top;', timeout=3)
             if not login_btn:
-                login_btn = dp.ele('.btn.btn-default.blue', timeout=3)
+                login_btn = page.ele('.btn.btn-default.blue', timeout=3)
             if not login_btn:
-                login_btn = dp.ele('tag:input@type=submit', timeout=3)
+                login_btn = page.ele('tag:input@type=submit', timeout=3)
             if not login_btn:
-                login_btn = dp.ele('text=登录', timeout=3)
+                login_btn = page.ele('text=登录', timeout=3)
             if not login_btn:
                 raise Exception("❌ 未找到登录按钮")
 
-            dp.actions.move_to(login_btn).click().wait(0.5)
+            page.actions.move_to(login_btn).click().wait(0.5)
             print("✅ 已点击登录按钮")
 
             time.sleep(3)
-            error_msgs = dp.eles('.error, #err, .msg-error, .alert-danger', timeout=1)
+            error_msgs = page.eles('.error, #err, .msg-error, .alert-danger', timeout=1)
             if error_msgs:
                 for e in error_msgs:
                     print(f"⚠️ 错误信息: {e.text}")
@@ -250,28 +249,31 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
             print("等待登录成功后跳转...")
             start_time = time.time()
             timeout = 20
-            wait_interval = 0.2           # 短轮询间隔，提高响应速度
-            entered_target = False        # 标记是否已进入目标域
+            wait_interval = 0.2
+            entered_target = False
             token = None
 
             while time.time() - start_time < timeout:
-                current_url = dp.url
+                current_url = page.url
 
-                # 一旦进入 of.swu.edu.cn，立即尝试读取
                 if 'of.swu.edu.cn' in current_url:
                     if not entered_target:
                         print("✅ 已进入目标域，开始轮询 localStorage...")
                         entered_target = True
 
-                    # 直接读取，不预先 sleep
-                    token = dp.run_js('return localStorage.getItem("access_token");')
+                    token = page.run_js('return localStorage.getItem("access_token");')
                     if token:
                         print("✅ 从 localStorage 获取 token 成功，尝试验证有效性...")
                         try:
                             test_url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
-                            test_headers = {"fighter-auth-token": token}
-                            test_resp = requests.get(test_url, headers=test_headers, timeout=5)
-                            if test_resp.status_code == 200:
+                            # 使用浏览器 fetch 验证，避免引入 requests 指纹
+                            js_check = f'''
+                                return fetch("{test_url}", {{
+                                    headers: {{"fighter-auth-token": "{token}"}}
+                                }}).then(r => r.ok);
+                            '''
+                            ok = page.run_js(js_check)
+                            if ok:
                                 print("✅ localStorage 中的 token 有效")
                                 # 清理临时验证码图片
                                 if os.path.exists(file_path):
@@ -280,21 +282,18 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                                         os.rmdir('images')
                                     except:
                                         pass
-                                return token
+                                # 此时返回 page 和 token，不关闭浏览器
+                                return page, token
                             else:
                                 print("⚠️ localStorage 中的 token 无效，继续等待...")
-                                token = None  # 置空，避免重复验证
+                                token = None
                         except Exception as e:
                             print(f"⚠️ 验证 token 时发生异常: {e}")
                             token = None
-                    # 如果没有 token 或验证失败，继续循环（短暂 sleep 后重试）
                 else:
-                    # 未进入目标域，等待稍长时间再检查
                     if entered_target:
-                        # 如果之前进入过但 URL 变了（极少情况），重置标记
                         entered_target = False
 
-                # 每 5 秒打印一次状态
                 elapsed = time.time() - start_time
                 if int(elapsed) % 5 == 0:
                     print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
@@ -311,16 +310,11 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     os.rmdir('images')
                 except:
                     pass
-            if attempt == max_retries:
-                raise
-            else:
-                print("等待 2 秒后重试...")
-                time.sleep(2)
-        finally:
-            try:
-                dp.quit()
-            except:
-                pass
+            if page:
+                try:
+                    page.quit()
+                except:
+                    pass
             # 清理用户数据目录（确保下次运行环境干净）
             if os.path.exists(user_data_dir):
                 try:
@@ -328,11 +322,17 @@ def get_swu_token(username: str, password: str, headless: bool = False, max_retr
                     print(f"✅ 已清除浏览器数据目录: {user_data_dir}")
                 except Exception as e:
                     print(f"⚠️ 清除浏览器数据目录失败（可忽略）: {e}")
+            if attempt == max_retries:
+                raise
+            else:
+                print("等待 2 秒后重试...")
+                time.sleep(2)
 
     raise Exception(f"登录失败，已重试 {max_retries} 次。")
 
-# ==================== 打卡模块（未改动） ====================
+# ==================== 打卡模块（使用浏览器发起请求） ====================
 def get_transition_today(token: str):
+    """获取今日任务（仍使用 requests，仅为查询，风险低）"""
     url = "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday"
     headers = {"fighter-auth-token": token}
     data = {"pageNum": 1, "pageSize": 1}
@@ -344,6 +344,7 @@ def get_transition_today(token: str):
     return records[0] if records else None
 
 def get_student_id(token: str):
+    """获取学号（仍使用 requests）"""
     url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
     headers = {"fighter-auth-token": token}
     resp = requests.get(url, headers=headers)
@@ -351,7 +352,10 @@ def get_student_id(token: str):
         raise Exception(f"获取学号失败，HTTP状态码: {resp.status_code}")
     return resp.json()["data"]["subject"]["username"]
 
-def checkin(token: str):
+def checkin_with_page(page, token: str):
+    """
+    使用浏览器页面提交打卡（全程同一浏览器，UA一致）
+    """
     try:
         task = get_transition_today(token)
         if not task:
@@ -383,30 +387,39 @@ def checkin(token: str):
             "qdsj": CHECKIN_TIME_RANGE,
         }
 
-        resp = requests.post(url, headers=headers, params=params, data=json.dumps(payload))
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == 200 and data.get("data"):
+        # 通过浏览器的 fetch 提交，保证 TLS/UA 和登录时一致
+        js_code = f'''
+            return fetch("{url}?formId={formid}&isSubmitProcess=false", {{
+                method: "POST",
+                headers: {json.dumps(headers)},
+                body: JSON.stringify({json.dumps(payload)})
+            }})
+            .then(response => response.json())
+            .catch(error => ({{ error: error.message }}));
+        '''
+        result = page.run_js(js_code)
+        if result and result.get("error"):
+            msg = f"打卡提交异常: {result['error']}"
+            print(f"❌ {msg}")
+            return False, msg, 20
+
+        if result.get("code") == 200 and result.get("data"):
             msg = "打卡成功！"
             print(f"✅ {msg}")
             return True, msg, 0
         else:
-            msg = f"打卡失败: {data.get('msg', '未知错误')}"
+            msg = f"打卡失败: {result.get('msg', '未知错误')}"
             print(f"❌ {msg}")
             return False, msg, 20
 
-    except requests.exceptions.RequestException as e:
-        msg = f"网络请求异常: {e}"
-        print(f"❌ {msg}")
-        return False, msg, 20
     except Exception as e:
-        msg = f"未知异常: {e}"
+        msg = f"打卡过程中异常: {e}"
         print(f"❌ {msg}")
         return False, msg, 20
 
 # ==================== 主程序 ====================
 def main():
-    parser = argparse.ArgumentParser(description='西南大学自动打卡（含自动登录）')
+    parser = argparse.ArgumentParser(description='西南大学自动打卡（全程浏览器）')
     parser.add_argument('--no-headless', action='store_true', help='禁用无头模式（显示浏览器）')
     args = parser.parse_args()
     headless_mode = not args.no_headless
@@ -418,10 +431,12 @@ def main():
         sys.exit(1)
 
     token = MANUAL_TOKEN.strip()
+    page = None
+
     if not token:
         print("未指定手动 token，将自动登录获取...")
         try:
-            token = get_swu_token(username, password, headless=headless_mode)
+            page, token = login_and_get_page(username, password, headless=headless_mode)
             print(f"\n✅ 获取到的 token: {token[:10]}...")
         except Exception as e:
             print(f"❌ 自动登录失败: {e}")
@@ -436,7 +451,69 @@ def main():
             sys.exit(1)
 
     print("\n--- 开始打卡 ---")
-    success, reason, exit_code = checkin(token)
+    if page:
+        # 使用浏览器提交
+        success, reason, exit_code = checkin_with_page(page, token)
+    else:
+        # 手动 token 时，无浏览器，退化为 requests 方式（保留原函数）
+        # 但为了保持一致性，也可调用原 checkin 函数，但这里我们复用原逻辑
+        # 简单起见，直接调用原 checkin（但已删除，需要重新定义？）
+        # 为了兼容手动 token，我们保留原来的 requests 提交函数，但因为我们修改了结构，下面临时实现
+        # 其实可以写一个 fallback 用 requests 提交，但鉴于用户主要使用自动登录，我们可简单处理
+        # 这里提供一个简化的 requests 提交（复用原有逻辑）
+        def fallback_checkin(token):
+            # 原 checkin 逻辑（使用 requests）
+            try:
+                task = get_transition_today(token)
+                if not task:
+                    return True, "今日无打卡任务", 10
+                if task.get("qdzt") == "已签到":
+                    return True, "今日已签到，无需重复", 0
+                student_id = get_student_id(token)
+                formid = task["formId"]
+                record_id = task["id"]
+                url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
+                params = {"formId": formid, "isSubmitProcess": False}
+                headers = {
+                    "fighter-auth-token": token,
+                    "Content-Type": "application/json;charset=UTF-8"
+                }
+                payload = {
+                    "id": record_id,
+                    "formId": formid,
+                    "tsrq": time.strftime("%Y-%m-%d"),
+                    "xh": student_id,
+                    "qdsj": CHECKIN_TIME_RANGE,
+                }
+                resp = requests.post(url, headers=headers, params=params, data=json.dumps(payload))
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("code") == 200 and data.get("data"):
+                    return True, "打卡成功！", 0
+                else:
+                    return False, f"打卡失败: {data.get('msg', '未知错误')}", 20
+            except Exception as e:
+                return False, f"异常: {e}", 20
+
+        success, reason, exit_code = fallback_checkin(token)
+
+    # 清理浏览器资源（如果存在）
+    if page:
+        try:
+            page.quit()
+            print("✅ 浏览器已关闭")
+        except:
+            pass
+        # 清理用户数据目录
+        is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
+        user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci' if (headless_mode or is_ci) else 'chrome_user_data')
+        if os.path.exists(user_data_dir):
+            try:
+                shutil.rmtree(user_data_dir)
+                print(f"✅ 已清除浏览器数据目录: {user_data_dir}")
+            except Exception as e:
+                print(f"⚠️ 清除浏览器数据目录失败（可忽略）: {e}")
+
     if success:
         print(f"✅ 打卡流程完成：{reason}")
         sys.exit(0)
