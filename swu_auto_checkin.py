@@ -231,7 +231,8 @@ def login_and_get_page(username: str, password: str, headless: bool = False, max
 
             page.actions.move_to(login_btn).click().wait(0.5)
             print("✅ 已点击登录按钮")
-
+            time.sleep(0.5)
+            dp.get(login_url)
             time.sleep(3)
             error_msgs = page.eles('.error, #err, .msg-error, .alert-danger', timeout=1)
             if error_msgs:
