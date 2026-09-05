@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-西南大学自动打卡脚本（全程浏览器版）- 零警告最终版
-- 所有静态检查警告均通过 # noqa / # type: ignore 显式忽略
-- 兼容 Python 3.8+，Windows/Linux
-"""
-
 import os
 import sys
 import time
