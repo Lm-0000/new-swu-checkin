@@ -83,39 +83,26 @@ def cleanup_user_data(user_data_dir: str) -> None:
             print(f"⚠️ 清除浏览器数据目录失败（可忽略）: {e}")
 
 def create_browser_page(chrome_path: str, headless: bool = False) -> ChromiumPage:
-    """
-    创建并返回 ChromiumPage 实例，根据 headless 配置启动选项
-    """
     is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
-    user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci' if (headless or is_ci) else 'chrome_user_data')
+    use_headless = headless or is_ci
 
     co = ChromiumOptions()
     co.set_paths(browser_path=chrome_path)
 
-    if headless or is_ci:
-        co.set_argument('--headless')
-        co.set_argument('--no-sandbox')
-        co.set_argument('--disable-dev-shm-usage')
-        co.set_argument('--disable-gpu')
-        co.set_argument('--disable-software-rasterizer')
-        co.set_argument('--disable-setuid-sandbox')
-        co.set_argument('--disable-features=HttpsUpgrades')
-        co.set_argument('--window-size=1920,1080')
-        co.set_argument('--disable-blink-features=AutomationControlled')
-        co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        debug_port = get_available_port()
-        co.set_argument(f'--remote-debugging-port={debug_port}')
-        co.set_user_data_path(user_data_dir)
-    else:
-        co.auto_port(True)
-        co.set_argument('--window-size=1920,1080')
-        co.set_argument('--no-sandbox')
-        co.set_argument('--disable-gpu')
-        co.set_argument('--disable-dev-shm-usage')
-        co.set_user_data_path(user_data_dir)
-
+    # 通用参数（无端口相关）
+    co.set_argument('--window-size=1920,1080')
+    co.set_argument('--no-sandbox')
+    co.set_argument('--disable-gpu')
+    co.set_argument('--disable-dev-shm-usage')
     co.set_argument('--disable-cache')
     co.set_argument('--disable-application-cache')
+    if use_headless:
+        co.set_argument('--headless=new')
+        co.set_argument('--disable-blink-features=AutomationControlled')
+        co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+    # 不设置用户数据目录，避免权限/冲突问题
+    # co.set_user_data_path(...)  # 注释掉
 
     return ChromiumPage(co)
 
