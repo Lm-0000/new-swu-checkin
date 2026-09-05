@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-西南大学自动打卡脚本（全程浏览器版）
+西南大学自动打卡脚本（全程浏览器版）- 优化版
 - 登录、获取 token、提交打卡均在同一浏览器会话中完成，UA/TLS 指纹全程一致
 - 支持 GitHub Actions 无头模式
 - 每次运行自动清除浏览器数据，保证环境干净
-- 登录交互代码完全保留原样
+- 改进：跳转等待、验证码刷新、随机时间抖动、重试次数降低
 """
 
 import os
@@ -17,6 +17,7 @@ import argparse
 import subprocess
 import socket
 import shutil
+import random
 import requests
 import ddddocr
 from typing import Optional, Tuple
@@ -24,7 +25,8 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 
 # ==================== 配置区 ====================
 MANUAL_TOKEN = ""                     # 留空则自动登录
-CHECKIN_TIME_RANGE = ["21:00", "23:30"]
+CHECKIN_TIME_RANGE = ["21:00", "23:30"]  # 基础时间段，脚本会自动添加随机秒数
+MAX_RETRIES = 2                       # 登录重试次数（原5次，现降低防锁号）
 
 # ==================== 工具函数 ====================
 def get_chrome_path() -> str:
@@ -48,7 +50,7 @@ def get_chrome_path() -> str:
         result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
         if result.returncode == 0 and os.path.isfile(result.stdout.strip()):
             return result.stdout.strip()
-    except (subprocess.SubprocessError, OSError):  # 命令执行异常可忽略
+    except (subprocess.SubprocessError, OSError):
         pass
     raise Exception("❌ 未找到 Chrome 浏览器")
 
@@ -88,7 +90,7 @@ def create_browser_page(chrome_path: str, headless: bool = False) -> ChromiumPag
     user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci' if (headless or is_ci) else 'chrome_user_data')
 
     co = ChromiumOptions()
-    co.set_paths(browser_path=chrome_path)  # type: ignore
+    co.set_paths(browser_path=chrome_path)
 
     if headless or is_ci:
         co.set_argument('--headless')
@@ -119,7 +121,7 @@ def create_browser_page(chrome_path: str, headless: bool = False) -> ChromiumPag
 
 # ==================== 登录模块 ====================
 def login_and_get_page(username: str, password: str,
-                       headless: bool = False, max_retries: int = 5) -> Tuple[ChromiumPage, str]:
+                       headless: bool = False, max_retries: int = MAX_RETRIES) -> Tuple[ChromiumPage, str]:
     """
     自动登录西南大学统一认证，从 localStorage 获取 access_token
     返回 (page, token)
@@ -136,48 +138,68 @@ def login_and_get_page(username: str, password: str,
         try:
             page = create_browser_page(chrome_path, headless)
             print("✅ 浏览器启动成功")
-        except Exception as e1:  # noinspection PyBroadException
+        except Exception as e1:
             print(f"❌ 浏览器启动失败: {e1}")
             if headless or is_ci:
                 try:
                     page = create_browser_page(chrome_path, False)
                     print("✅ 已切换到非无头模式启动（auto_port）")
-                except Exception as e2:  # noinspection PyBroadException
+                except Exception as e2:
                     print(f"❌ 非无头模式也启动失败: {e2}")
                     raise
             else:
                 raise
 
         try:
-            # 登录交互
+            # -------------------- 登录交互 --------------------
             login_url = ('https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL'
                          '?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter')
             page.get(login_url)
             print(f"当前页面标题: {page.title}")
             print(f"当前URL: {page.url}")
 
+            # 点击统一认证按钮（如果存在）
             unified_btn = page.ele('@src=img/unified_button.png', timeout=5.0)
             if unified_btn:
                 unified_btn.click()
                 print("已点击统一认证按钮，等待跳转...")
-                time.sleep(3)
-                print(f"跳转后标题: {page.title}")
-                print(f"跳转后URL: {page.url}")
-
-            if 'Login' not in page.url:
-                print("未进入登录页，尝试直接访问基础登录页...")
+                # ---- 改进1：轮询等待跳转，而非固定sleep ----
+                wait_start = time.time()
+                while time.time() - wait_start < 8:  # 最多等待8秒
+                    time.sleep(0.5)
+                    current_url = page.url
+                    if 'idm.swu.edu.cn' in current_url or 'Login' in current_url:
+                        print(f"✅ 跳转成功，当前URL: {current_url[:100]}...")
+                        break
+                else:
+                    # 超时未跳转，尝试刷新页面
+                    print("⚠️ 跳转超时，尝试刷新页面...")
+                    page.refresh()
+                    time.sleep(3)
+                    # 再次检查
+                    if 'idm.swu.edu.cn' not in page.url and 'Login' not in page.url:
+                        print("⚠️ 刷新后仍未进入登录页，尝试直接访问基础登录页...")
+                        page.get('https://idm.swu.edu.cn/am/UI/Login')
+                        time.sleep(2)
+            else:
+                # 没有统一认证按钮，直接访问基础登录页
+                print("未找到统一认证按钮，直接访问基础登录页...")
                 page.get('https://idm.swu.edu.cn/am/UI/Login')
                 time.sleep(2)
-                print(f"基础登录页URL: {page.url}")
+
+            print(f"当前登录页标题: {page.title}")
+            print(f"当前登录页URL: {page.url}")
 
             print("等待登录表单加载...")
             time.sleep(1)
 
+            # 处理 iframe
             iframes = page.eles('tag:iframe', timeout=3.0)
             if iframes:
                 print(f"发现 {len(iframes)} 个 iframe，尝试切换到第一个")
-                page.to_frame(iframes[0])  # type: ignore
+                page.to_frame(iframes[0])
 
+            # 用户名
             username_input = (page.ele('@name=username', timeout=3.0) or
                               page.ele('@name=j_username', timeout=3.0))
             if not username_input:
@@ -189,6 +211,7 @@ def login_and_get_page(username: str, password: str,
             username_input.clear().input(username)
             print("✅ 已输入用户名")
 
+            # 密码
             password_input = (page.ele('@name=password', timeout=3.0) or
                               page.ele('@name=j_password', timeout=3.0))
             if not password_input:
@@ -200,29 +223,52 @@ def login_and_get_page(username: str, password: str,
             password_input.clear().input(password)
             print("✅ 已输入密码")
 
-            print("正在获取验证码...")
-            time.sleep(0.5)
-            img = page.ele('@id=kaptchaImage', timeout=5.0) or page.ele('@src=/am/validate.code', timeout=5.0)
-            if not img:
-                all_imgs = page.eles('tag:img', timeout=3.0)
-                for i in all_imgs:
-                    src = i.attr('src') or ''
-                    if 'captcha' in src.lower() or 'code' in src.lower():
-                        img = i
-                        break
-            if not img:
-                raise RuntimeError("❌ 未找到验证码图片")
+            # ---- 改进2：验证码识别与自动刷新 ----
+            captcha_retry = 0
+            captcha_code = None
+            while captcha_retry < 3:
+                print("正在获取验证码...")
+                time.sleep(0.5)
+                img = page.ele('@id=kaptchaImage', timeout=5.0) or page.ele('@src=/am/validate.code', timeout=5.0)
+                if not img:
+                    all_imgs = page.eles('tag:img', timeout=3.0)
+                    for i in all_imgs:
+                        src = i.attr('src') or ''
+                        if 'captcha' in src.lower() or 'code' in src.lower():
+                            img = i
+                            break
+                if not img:
+                    raise RuntimeError("❌ 未找到验证码图片")
 
-            os.makedirs('images', exist_ok=True)
-            img.save(path='images', name='captcha.png')
-            print("✅ 验证码图片已保存")
+                os.makedirs('images', exist_ok=True)
+                img.save(path='images', name='captcha.png')
+                print("✅ 验证码图片已保存")
 
-            with open('images/captcha.png', 'rb') as f:
-                image_bytes = f.read()
-            ocr = ddddocr.DdddOcr(show_ad=False)
-            result = ocr.classification(image_bytes)
-            print(f"识别到的验证码: {result}")
+                with open('images/captcha.png', 'rb') as f:
+                    image_bytes = f.read()
+                ocr = ddddocr.DdddOcr(show_ad=False)
+                result = ocr.classification(image_bytes)
+                print(f"识别到的验证码: {result}")
 
+                # 检查识别结果是否合理（长度>=4，且仅包含数字字母）
+                if len(result) >= 4 and result.isalnum():
+                    captcha_code = result
+                    break
+                else:
+                    print(f"⚠️ 验证码识别结果不合理（{result}），刷新验证码重试...")
+                    # 点击验证码图片刷新
+                    try:
+                        img.click()
+                    except Exception:
+                        pass
+                    captcha_retry += 1
+                    time.sleep(1)
+                    continue
+
+            if captcha_code is None:
+                raise RuntimeError("❌ 验证码识别失败，多次重试后仍无法获得有效结果")
+
+            # 输入验证码
             captcha_input = (page.ele('@name=captcha', timeout=3.0) or
                              page.ele('@name=verificationCode', timeout=3.0))
             if not captcha_input:
@@ -236,12 +282,13 @@ def login_and_get_page(username: str, password: str,
 
             captcha_input.clear()
             page.actions.click(captcha_input).wait(0.1)
-            for ch in result:
+            for ch in captcha_code:
                 page.actions.type(ch).wait(0.05)
             if username_input:
                 username_input.click()
             page.actions.wait(0.2)
 
+            # 触发事件
             page.run_js('''
                 var el = arguments[0];
                 el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -253,6 +300,7 @@ def login_and_get_page(username: str, password: str,
             time.sleep(0.3)
             print("✅ 已输入验证码")
 
+            # 登录按钮
             login_btn = (page.ele('@style=vertical-align: top;', timeout=3.0) or
                          page.ele('.btn.btn-default.blue', timeout=3.0) or
                          page.ele('tag:input@type=submit', timeout=3.0) or
@@ -269,7 +317,7 @@ def login_and_get_page(username: str, password: str,
                     print(f"⚠️ 错误信息: {e_msg.text}")
                 raise RuntimeError(f"登录失败: {error_msgs[0].text}")
 
-            # token 提取
+            # -------------------- token 提取 --------------------
             time.sleep(0.5)
             page.get(login_url)
             time.sleep(2)
@@ -305,7 +353,7 @@ def login_and_get_page(username: str, password: str,
                             else:
                                 print("⚠️ localStorage 中的 token 无效，继续等待...")
                                 token = None
-                        except Exception as e:  # noinspection PyBroadException
+                        except Exception as e:
                             print(f"⚠️ 验证 token 时发生异常: {e}")
                             token = None
                 else:
@@ -320,13 +368,13 @@ def login_and_get_page(username: str, password: str,
 
             raise RuntimeError("获取 token 超时（20s），未从 localStorage 获取到有效 access_token")
 
-        except Exception as e:  # noinspection PyBroadException
+        except Exception as e:
             print(f"第 {attempt} 次尝试失败: {e}")
             remove_captcha_image()
             if page:
                 try:
                     page.quit()
-                except Exception:  # noinspection PyBroadException
+                except Exception:
                     pass
             cleanup_user_data(user_data_dir)
             if attempt == max_retries:
@@ -364,7 +412,7 @@ def get_student_id(token: str) -> str:
         raise RuntimeError(f"获取学号失败: {e}") from e
 
 def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str, int]:
-    """使用浏览器页面提交打卡"""
+    """使用浏览器页面提交打卡（打卡时间随机抖动）"""
     try:
         task = get_transition_today(token)
         if not task:
@@ -379,12 +427,27 @@ def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str, int]:
         record_id = task["id"]
         url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
         headers = {"fighter-auth-token": token, "Content-Type": "application/json;charset=UTF-8"}
+
+        # ---- 改进3：打卡时间随机抖动（±30秒） ----
+        base_time = CHECKIN_TIME_RANGE[0]  # "21:00"
+        hour, minute = map(int, base_time.split(':'))
+        # 随机秒数（0~59），使时间变为 21:xx:yy
+        rand_sec = random.randint(0, 59)
+        # 分钟也可能微调，但为了不偏离太远，只改秒
+        time_str = f"{hour:02d}:{minute:02d}:{rand_sec:02d}"
+        # 第二个时间也随机，但保持与第一个有一定间隔（默认23:30）
+        end_hour, end_minute = map(int, CHECKIN_TIME_RANGE[1].split(':'))
+        end_rand_sec = random.randint(0, 59)
+        end_time_str = f"{end_hour:02d}:{end_minute:02d}:{end_rand_sec:02d}"
+        qdsj = [time_str, end_time_str]
+        print(f"本次打卡时间段: {qdsj}")
+
         payload = {
             "id": record_id,
             "formId": formid,
             "tsrq": time.strftime("%Y-%m-%d"),
             "xh": student_id,
-            "qdsj": CHECKIN_TIME_RANGE,
+            "qdsj": qdsj,
         }
 
         js_code = f'''
@@ -403,7 +466,7 @@ def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str, int]:
             return True, "打卡成功！", 0
         else:
             return False, f"打卡失败: {result.get('msg', '未知错误')}", 20
-    except Exception as e:  # noinspection PyBroadException
+    except Exception as e:
         return False, f"打卡过程中异常: {e}", 20
 
 def fallback_checkin(tok: str) -> Tuple[bool, str, int]:
@@ -420,12 +483,23 @@ def fallback_checkin(tok: str) -> Tuple[bool, str, int]:
         record_id = task["id"]
         url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
         headers = {"fighter-auth-token": tok, "Content-Type": "application/json;charset=UTF-8"}
+
+        # 同样随机抖动
+        base_time = CHECKIN_TIME_RANGE[0]
+        hour, minute = map(int, base_time.split(':'))
+        rand_sec = random.randint(0, 59)
+        time_str = f"{hour:02d}:{minute:02d}:{rand_sec:02d}"
+        end_hour, end_minute = map(int, CHECKIN_TIME_RANGE[1].split(':'))
+        end_rand_sec = random.randint(0, 59)
+        end_time_str = f"{end_hour:02d}:{end_minute:02d}:{end_rand_sec:02d}"
+        qdsj = [time_str, end_time_str]
+
         payload = {
             "id": record_id,
             "formId": formid,
             "tsrq": time.strftime("%Y-%m-%d"),
             "xh": stu_id,
-            "qdsj": CHECKIN_TIME_RANGE,
+            "qdsj": qdsj,
         }
         resp = requests.post(url, headers=headers, params={"formId": formid, "isSubmitProcess": False},
                              data=json.dumps(payload), timeout=10)
@@ -435,7 +509,7 @@ def fallback_checkin(tok: str) -> Tuple[bool, str, int]:
             return True, "打卡成功！", 0
         else:
             return False, f"打卡失败: {data.get('msg', '未知错误')}", 20
-    except Exception as e:  # noinspection PyBroadException
+    except Exception as e:
         return False, f"异常: {e}", 20
 
 # ==================== 主程序 ====================
@@ -472,12 +546,9 @@ def main():
             sys.exit(1)
 
     print("\n--- 开始打卡 ---")
-    # noinspection PyUnusedLocal
-    if page is not None:   # 显式使用 page
+    if page is not None:
         success, reason, exit_code = checkin_with_page(page, token)
     else:
-        # 显式引用 page 以消除未使用警告（实际不会执行）
-        _ = page
         success, reason, exit_code = fallback_checkin(token)
 
     # 清理浏览器资源
@@ -485,7 +556,7 @@ def main():
         try:
             page.quit()
             print("✅ 浏览器已关闭")
-        except Exception:  # noinspection PyBroadException
+        except Exception:
             pass
         is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
         user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci' if (headless_mode or is_ci) else 'chrome_user_data')
