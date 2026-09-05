@@ -152,8 +152,7 @@ def login_and_get_page(username: str, password: str,
 
         try:
             # -------------------- 登录交互 --------------------
-            login_url = ('https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL'
-                         '?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter')
+            login_url = ('https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter')
             page.get(login_url)
             print(f"当前页面标题: {page.title}")
             print(f"当前URL: {page.url}")
