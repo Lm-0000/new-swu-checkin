@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-西南大学自动打卡脚本（全程浏览器版）
-- 登录、获取 token、提交打卡均在同一浏览器会话中完成，UA/TLS 指纹全程一致
-- 支持 GitHub Actions 无头模式
-- 每次运行自动清除浏览器数据，保证环境干净
-- 登录交互代码完全保留原样
+西南大学自动打卡脚本（整合版）
+- 登录模块（验证码重试、清晰流程）
+- 打卡模块（使用浏览器 fetch，UA 指纹一致）
+- 支持无头模式、手动 Token 回退
+- 重构版本 v5：所有静态检查警告已消除
 """
 
 import os
@@ -14,384 +14,446 @@ import sys
 import time
 import json
 import argparse
-import subprocess
-import socket
+import random
 import shutil
-import ddddocr
+from typing import Tuple, Generator, Optional, Any
+from contextlib import contextmanager
+
 import requests
+import ddddocr  # 验证码识别
 from DrissionPage import ChromiumPage, ChromiumOptions
 
-# ==================== 配置区 ====================
-MANUAL_TOKEN = ""                     # 留空则自动登录
+# ==================== 配置常量 ====================
+MANUAL_TOKEN = ""
 CHECKIN_TIME_RANGE = ["21:00", "23:30"]
+MAX_RETRIES = 3
+LOGIN_URL = (
+    'https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL'
+    '?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return'
+    '%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter'
+)
+BASE_LOGIN_URL = 'https://idm.swu.edu.cn/am/UI/Login'
+API_USER_URL = 'https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal'
+API_TASK_URL = 'https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday'
+API_CHECKIN_URL = 'https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save'
+CAPTCHA_IMG_DIR = 'images'
+CAPTCHA_IMG_PATH = os.path.join(CAPTCHA_IMG_DIR, 'captcha.png')
+TIMEOUT_PAGE_LOAD = 20
+TIMEOUT_API = 10
 
 # ==================== 工具函数 ====================
-def get_chrome_path():
-    chrome_path = os.environ.get('CHROME_PATH')
-    if chrome_path and os.path.isfile(chrome_path):
-        return chrome_path
-    for path in [
-        '/usr/bin/google-chrome', '/usr/bin/chromium-browser', '/usr/bin/chromium',
+def get_chrome_path() -> str:
+    """获取 Chrome/Chromium 可执行文件路径"""
+    env_path = os.environ.get('CHROME_PATH')
+    if env_path and os.path.isfile(env_path):
+        return str(env_path)
+
+    # 合并所有可能的路径，减少重复
+    possible_paths = [
+        '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium-browser', '/usr/bin/chromium',
         '/opt/google/chrome/chrome',
-    ]:
-        if os.path.isfile(path):
-            return path
-    for path in [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]:
+    ]
+    for path in possible_paths:
         if os.path.isfile(path):
             return path
-    try:
-        result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
-        if result.returncode == 0 and os.path.isfile(result.stdout.strip()):
-            return result.stdout.strip()
-    except:
-        pass
-    raise Exception("❌ 未找到 Chrome 浏览器")
 
-def get_available_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+    # 通过 shutil.which 查找（显式字符串，避免 PathLike 警告）
+    for cmd in ('google-chrome', 'chrome'):
+        chrome_cmd = shutil.which(cmd)
+        if chrome_cmd:
+            return str(chrome_cmd)
 
-# ==================== 登录模块（返回浏览器对象和token） ====================
-def login_and_get_page(username: str, password: str, headless: bool = False, max_retries: int = 5):
-    """
-    自动登录西南大学统一认证，从 localStorage 获取 access_token
-    返回 (page, token)，page 为已登录的浏览器页面，token 为有效凭证
-    """
+    raise RuntimeError("❌ 未找到 Chrome 浏览器")
+
+
+def remove_captcha_image() -> None:
+    """清理验证码图片缓存"""
+    if os.path.exists(CAPTCHA_IMG_PATH):
+        try:
+            os.remove(CAPTCHA_IMG_PATH)
+        except OSError:
+            pass
+        try:
+            os.rmdir(CAPTCHA_IMG_DIR)
+        except OSError:
+            pass
+
+
+def generate_random_time_range(base_start: str, base_end: str) -> Tuple[str, str]:
+    """生成随机时间（精确到秒）"""
+    def randomize_time(time_str: str) -> str:
+        h, m = map(int, time_str.split(':'))
+        s = random.randint(0, 59)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return randomize_time(base_start), randomize_time(base_end)
+
+
+@contextmanager
+def browser_page(headless: bool = False) -> Generator[ChromiumPage, None, None]:
+    """上下文管理器，自动创建和清理浏览器页面"""
     chrome_path = get_chrome_path()
-    print(f"✅ 使用 Chrome: {chrome_path}")
-
     is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
-    user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci' if (headless or is_ci) else 'chrome_user_data')
+    use_headless = headless or is_ci
 
-    for attempt in range(1, max_retries + 1):
-        print(f"\n--- 第 {attempt} 次尝试登录 ---")
-        co = ChromiumOptions()
-        co.set_paths(browser_path=chrome_path)
+    co = ChromiumOptions()
+    # 第三方库类型定义缺失，忽略类型检查
+    co.set_paths(browser_path=chrome_path)  # type: ignore[attr-defined]
+    co.set_argument('--window-size=1920,1080')
+    co.set_argument('--no-sandbox')
+    co.set_argument('--disable-gpu')
+    co.set_argument('--disable-dev-shm-usage')
+    co.set_argument('--disable-cache')
+    co.set_argument('--disable-application-cache')
 
-        if headless or is_ci:
-            co.set_argument('--headless')
-            co.set_argument('--no-sandbox')
-            co.set_argument('--disable-dev-shm-usage')
-            co.set_argument('--disable-gpu')
-            co.set_argument('--disable-software-rasterizer')
-            co.set_argument('--disable-setuid-sandbox')
-            co.set_argument('--disable-features=HttpsUpgrades')
-            co.set_argument('--window-size=1920,1080')
-            co.set_argument('--disable-blink-features=AutomationControlled')
-            co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-            debug_port = get_available_port()
-            co.set_argument(f'--remote-debugging-port={debug_port}')
-            co.set_user_data_path(user_data_dir)
+    if use_headless:
+        co.set_argument('--headless=new')
+        co.set_argument('--disable-blink-features=AutomationControlled')
+        co.set_argument(
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+
+    page = ChromiumPage(co)
+    try:
+        yield page
+    finally:
+        try:
+            page.quit()
+        except Exception:  # 资源清理，忽略所有异常
+            pass
+
+
+def find_element(page: ChromiumPage, *selectors: Any, timeout: int = 3):
+    """按顺序尝试多个选择器，返回第一个匹配的元素"""
+    for sel in selectors:
+        if callable(sel):
+            el = sel(page)
         else:
-            co.auto_port(True)
-            co.set_argument('--window-size=1920,1080')
-            co.set_argument('--no-sandbox')
-            co.set_argument('--disable-gpu')
-            co.set_argument('--disable-dev-shm-usage')
-            co.set_user_data_path(user_data_dir)
+            el = page.ele(sel, timeout=timeout)
+        if el:
+            return el
+    return None
 
-        co.set_argument('--disable-cache')
-        co.set_argument('--disable-application-cache')
 
-        page = None
+def api_request(method: str, url: str, token: str,
+                params: Optional[dict] = None,
+                data: Optional[dict] = None,
+                json_data: Optional[dict] = None) -> dict:
+    """统一 API 请求"""
+    headers = {"fighter-auth-token": token}
+    if json_data is not None:
+        headers["Content-Type"] = "application/json;charset=UTF-8"
+    try:
+        resp = requests.request(
+            method, url, headers=headers, params=params,
+            data=data, json=json_data, timeout=TIMEOUT_API
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as e:
+        raise RuntimeError(f"API 请求失败: {e}") from e
+
+
+# ==================== 验证码识别 ====================
+def recognize_captcha(page: ChromiumPage, max_retries: int = 3) -> str:
+    """识别验证码，支持重试和刷新"""
+    ocr = ddddocr.DdddOcr(show_ad=False)
+    for attempt in range(max_retries):
+        img = find_element(
+            page,
+            '@id=kaptchaImage',
+            '@src=/am/validate.code',
+            lambda p: next((el for el in p.eles('tag:img', timeout=2)
+                            if 'captcha' in (el.attr('src') or '').lower() or
+                               'code' in (el.attr('src') or '').lower()), None)
+        )
+        if not img:
+            raise RuntimeError("❌ 未找到验证码图片元素")
+
+        os.makedirs(CAPTCHA_IMG_DIR, exist_ok=True)
+        img.save(path=CAPTCHA_IMG_DIR, name='captcha.png')
+
+        with open(CAPTCHA_IMG_PATH, 'rb') as f:
+            image_bytes = f.read()
+        result = ocr.classification(image_bytes)
+        print(f"识别到的验证码: {result}")
+
+        if len(result) >= 4 and result.isalnum():
+            return result
+
+        print(f"⚠️ 验证码识别结果不合理（{result}），刷新重试...")
         try:
-            page = ChromiumPage(co)
-            print("✅ 浏览器启动成功")
-        except Exception as e:
-            print(f"❌ 浏览器启动失败: {e}")
-            if headless or is_ci:
-                # 降级为非无头模式（auto_port）
-                co = ChromiumOptions()
-                co.set_paths(browser_path=chrome_path)
-                co.auto_port(True)
-                co.set_argument('--window-size=1920,1080')
-                co.set_argument('--no-sandbox')
-                co.set_argument('--disable-gpu')
-                co.set_argument('--disable-dev-shm-usage')
-                page = ChromiumPage(co)
-                print("✅ 已切换到非无头模式启动（auto_port）")
-            else:
-                raise
+            img.click()
+        except Exception:   # 点击刷新可能失败，忽略
+            pass
+        time.sleep(1)
 
-        try:
-            # ==================== 登录交互（完全保留原样） ====================
-            login_url = 'https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter'
-            page.get(login_url)
-            print(f"当前页面标题: {page.title}")
-            print(f"当前URL: {page.url}")
+    raise RuntimeError("❌ 验证码识别失败")
 
-            unified_btn = page.ele('@src=img/unified_button.png', timeout=5)
-            if unified_btn:
-                unified_btn.click()
-                print("已点击统一认证按钮，等待跳转...")
-                time.sleep(3)
-                print(f"跳转后标题: {page.title}")
-                print(f"跳转后URL: {page.url}")
 
-            if 'Login' not in page.url:
-                print("未进入登录页，尝试直接访问基础登录页...")
-                page.get('https://idm.swu.edu.cn/am/UI/Login')
-                time.sleep(2)
-                print(f"基础登录页URL: {page.url}")
+# ==================== 登录辅助函数 ====================
+def _wait_for_login_redirect(page: ChromiumPage) -> Optional[str]:
+    """等待登录成功，从 localStorage 提取 token"""
+    start_time = time.time()
+    entered_target = False
+    token = None
 
-            print("等待登录表单加载...")
-            time.sleep(1)
-
-            iframes = page.eles('tag:iframe', timeout=3)
-            if iframes:
-                print(f"发现 {len(iframes)} 个 iframe，尝试切换到第一个")
-                page.to_frame(iframes[0])
-                time.sleep(1)
-
-            username_input = page.ele('@name=username', timeout=3) or page.ele('@name=j_username', timeout=3)
-            if not username_input:
-                inputs = page.eles('tag:input@type=text', timeout=3)
-                if inputs:
-                    username_input = inputs[0]
-            if not username_input:
-                raise Exception("❌ 未找到用户名输入框")
-            username_input.clear().input(username)
-            print("✅ 已输入用户名")
-
-            password_input = page.ele('@name=password', timeout=3) or page.ele('@name=j_password', timeout=3)
-            if not password_input:
-                inputs = page.eles('tag:input@type=password', timeout=3)
-                if inputs:
-                    password_input = inputs[0]
-            if not password_input:
-                raise Exception("❌ 未找到密码输入框")
-            password_input.clear().input(password)
-            print("✅ 已输入密码")
-
-            print("正在获取验证码...")
-            time.sleep(0.5)
-            img = page.ele('@id=kaptchaImage', timeout=5) or page.ele('@src=/am/validate.code', timeout=5)
-            if not img:
-                all_imgs = page.eles('tag:img', timeout=3)
-                for i in all_imgs:
-                    src = i.attr('src') or ''
-                    if 'captcha' in src.lower() or 'code' in src.lower():
-                        img = i
-                        break
-            if not img:
-                raise Exception("❌ 未找到验证码图片")
-
-            os.makedirs('images', exist_ok=True)
-            file_path = 'images/captcha.png'
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            img.save(path='images', name='captcha.png')
-            print("✅ 验证码图片已保存")
-
-            with open(file_path, 'rb') as f:
-                image_bytes = f.read()
-            ocr = ddddocr.DdddOcr(show_ad=False)
-            result = ocr.classification(image_bytes)
-            print(f"识别到的验证码: {result}")
-
-            captcha_input = page.ele('@name=captcha', timeout=3) or page.ele('@name=verificationCode', timeout=3)
-            if not captcha_input:
-                inputs = page.eles('tag:input@type=text', timeout=3)
-                if inputs:
-                    if len(inputs) > 1:
-                        captcha_input = inputs[-1]
-                    else:
-                        captcha_input = inputs[0]
-            if not captcha_input:
-                captcha_input = page.ele('xpath://input[@type="text"][position()>2]', timeout=3)
-            if not captcha_input:
-                raise Exception("❌ 未找到验证码输入框")
-
-            captcha_input.clear()
-            page.actions.click(captcha_input).wait(0.1)
-            for ch in result:
-                page.actions.type(ch).wait(0.05)
-            if username_input:
-                username_input.click()
-            page.actions.wait(0.2)
-
-            page.run_js('''
-                var el = arguments[0];
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new Event('blur', { bubbles: true }));
-                el.dispatchEvent(new Event('keyup', { bubbles: true }));
-                el.dispatchEvent(new Event('keydown', { bubbles: true }));
-            ''', captcha_input)
-            time.sleep(0.3)
-            print("✅ 已输入验证码")
-
-            login_btn = page.ele('@style=vertical-align: top;', timeout=3)
-            if not login_btn:
-                login_btn = page.ele('.btn.btn-default.blue', timeout=3)
-            if not login_btn:
-                login_btn = page.ele('tag:input@type=submit', timeout=3)
-            if not login_btn:
-                login_btn = page.ele('text=登录', timeout=3)
-            if not login_btn:
-                raise Exception("❌ 未找到登录按钮")
-
-            page.actions.move_to(login_btn).click().wait(0.5)
-            print("✅ 已点击登录按钮")
-            time.sleep(1)
-            error_msgs = page.eles('.error, #err, .msg-error, .alert-danger', timeout=1)
-            if error_msgs:
-                for e in error_msgs:
-                    print(f"⚠️ 错误信息: {e.text}")
-                raise Exception(f"登录失败: {error_msgs[0].text}")
-
-            # ==================== token 提取（优化版：高稳定、高速度） ====================
-            time.sleep(0.5)
-            page.get(login_url)
-            time.sleep(2)
-            print("等待登录成功后跳转...")
-            start_time = time.time()
-            timeout = 20
-            wait_interval = 0.2
-            entered_target = False
-            token = None
-
-            while time.time() - start_time < timeout:
-                current_url = page.url
-
-                if 'of.swu.edu.cn' in current_url:
-                    if not entered_target:
-                        print("✅ 已进入目标域，开始轮询 localStorage...")
-                        entered_target = True
-
-                    token = page.run_js('return localStorage.getItem("access_token");')
-                    if token:
-                        print("✅ 从 localStorage 获取 token 成功，尝试验证有效性...")
-                        try:
-                            test_url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
-                            # 使用浏览器 fetch 验证，避免引入 requests 指纹
-                            js_check = f'''
-                                return fetch("{test_url}", {{
-                                    headers: {{"fighter-auth-token": "{token}"}}
-                                }}).then(r => r.ok);
-                            '''
-                            ok = page.run_js(js_check)
-                            if ok:
-                                print("✅ localStorage 中的 token 有效")
-                                # 清理临时验证码图片
-                                if os.path.exists(file_path):
-                                    os.remove(file_path)
-                                    try:
-                                        os.rmdir('images')
-                                    except:
-                                        pass
-                                # 此时返回 page 和 token，不关闭浏览器
-                                return page, token
-                            else:
-                                print("⚠️ localStorage 中的 token 无效，继续等待...")
-                                token = None
-                        except Exception as e:
-                            print(f"⚠️ 验证 token 时发生异常: {e}")
-                            token = None
-                else:
-                    if entered_target:
-                        entered_target = False
-
-                elapsed = time.time() - start_time
-                if int(elapsed) % 5 == 0:
-                    print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
-
-                time.sleep(wait_interval)
-
-            raise Exception("获取 token 超时（20s），未从 localStorage 获取到有效 access_token")
-
-        except Exception as e:
-            print(f"第 {attempt} 次尝试失败: {e}")
-            if os.path.exists('images/captcha.png'):
-                os.remove('images/captcha.png')
+    while time.time() - start_time < TIMEOUT_PAGE_LOAD:
+        current_url = page.url
+        if 'of.swu.edu.cn' in current_url:
+            if not entered_target:
+                print("✅ 已进入目标域，开始轮询 localStorage...")
+                entered_target = True
+            token = page.run_js('return localStorage.getItem("access_token");')
+            if token:
+                print("✅ 从 localStorage 获取 token 成功，验证有效性...")
                 try:
-                    os.rmdir('images')
-                except:
-                    pass
-            if page:
-                try:
-                    page.quit()
-                except:
-                    pass
-            # 清理用户数据目录（确保下次运行环境干净）
-            if os.path.exists(user_data_dir):
-                try:
-                    shutil.rmtree(user_data_dir)
-                    print(f"✅ 已清除浏览器数据目录: {user_data_dir}")
+                    test_url = API_USER_URL
+                    js_check = f'''
+                        return fetch("{test_url}", {{
+                            headers: {{"fighter-auth-token": "{token}"}}
+                        }}).then(r => r.ok);
+                    '''
+                    ok = page.run_js(js_check)
+                    if ok:
+                        print("✅ localStorage 中的 token 有效")
+                        return token
+                    print("⚠️ token 无效，继续等待...")
+                    token = None
                 except Exception as e:
-                    print(f"⚠️ 清除浏览器数据目录失败（可忽略）: {e}")
-            if attempt == max_retries:
-                raise
-            else:
+                    print(f"⚠️ 验证 token 异常: {e}")
+                    token = None
+        else:
+            if entered_target:
+                entered_target = False
+
+        elapsed = time.time() - start_time
+        if int(elapsed) % 5 == 0:
+            print(f"⏳ 已等待 {elapsed:.0f}s，当前 URL: {current_url[:80]}...")
+        time.sleep(0.2)
+
+    return None
+
+
+def _handle_iframe(page: ChromiumPage) -> None:
+    """切换 iframe（若存在）"""
+    iframes = page.eles('tag:iframe', timeout=3)
+    if iframes:
+        print(f"发现 {len(iframes)} 个 iframe，尝试切换")
+        try:
+            frame_method = getattr(page, 'to_frame', None) or getattr(page, 'switch_to_frame', None)
+            if frame_method:
+                frame_method(iframes[0])
+        except Exception as e:
+            print(f"⚠️ 切换 iframe 失败: {e}")
+
+
+def _navigate_to_login(page: ChromiumPage) -> None:
+    """导航到登录页，处理统一认证跳转"""
+    page.get(LOGIN_URL)
+    print(f"当前页面标题: {page.title}")
+
+    unified_btn = page.ele('@src=img/unified_button.png', timeout=5)
+    if unified_btn:
+        unified_btn.click()
+        print("已点击统一认证按钮，等待跳转...")
+        start_wait = time.time()
+        while time.time() - start_wait < 8:
+            time.sleep(0.5)
+            if 'idm.swu.edu.cn' in page.url or 'Login' in page.url:
+                print(f"✅ 跳转成功，当前URL: {page.url[:100]}...")
+                break
+        else:
+            print("⚠️ 跳转超时，尝试刷新页面...")
+            page.refresh()
+            time.sleep(3)
+            if 'idm.swu.edu.cn' not in page.url and 'Login' not in page.url:
+                print("⚠️ 刷新后仍未进入登录页，尝试直接访问基础登录页...")
+                page.get(BASE_LOGIN_URL)
+                time.sleep(2)
+    else:
+        print("未找到统一认证按钮，直接访问基础登录页...")
+        page.get(BASE_LOGIN_URL)
+        time.sleep(2)
+
+
+def _fill_login_form(page: ChromiumPage, username: str, password: str) -> str:
+    """
+    填写登录表单，返回识别出的验证码
+    """
+    # 用户名
+    username_input = find_element(
+        page,
+        '@name=username',
+        '@name=j_username',
+        lambda p: p.eles('tag:input@type=text', timeout=3)[0] if p.eles('tag:input@type=text', timeout=3) else None
+    )
+    if not username_input:
+        raise RuntimeError("❌ 未找到用户名输入框")
+    username_input.clear().input(username)
+    print("✅ 已输入用户名")
+
+    # 密码
+    password_input = find_element(
+        page,
+        '@name=password',
+        '@name=j_password',
+        lambda p: p.eles('tag:input@type=password', timeout=3)[0] if p.eles('tag:input@type=password', timeout=3) else None
+    )
+    if not password_input:
+        raise RuntimeError("❌ 未找到密码输入框")
+    password_input.clear().input(password)
+    print("✅ 已输入密码")
+
+    # 验证码
+    captcha_code = recognize_captcha(page)
+    print(f"最终识别验证码: {captcha_code}")
+
+    captcha_input = find_element(
+        page,
+        '@name=captcha',
+        '@name=verificationCode',
+        lambda p: p.eles('tag:input@type=text', timeout=3)[-1] if len(p.eles('tag:input@type=text', timeout=3)) > 1 else None,
+        'xpath://input[@type="text"][position()>2]'
+    )
+    if not captcha_input:
+        raise RuntimeError("❌ 未找到验证码输入框")
+
+    captcha_input.clear()
+    page.actions.click(captcha_input).wait(0.1)
+    for ch in captcha_code:
+        page.actions.type(ch).wait(0.05)
+    # 触发事件
+    page.run_js('''
+        var el = arguments[0];
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+        el.dispatchEvent(new Event('keyup', { bubbles: true }));
+        el.dispatchEvent(new Event('keydown', { bubbles: true }));
+    ''', captcha_input)
+    time.sleep(0.3)
+    print("✅ 已输入验证码")
+    return captcha_code
+
+
+def _click_login_button(page: ChromiumPage) -> None:
+    """点击登录按钮"""
+    login_btn = find_element(
+        page,
+        '@style=vertical-align: top;',
+        '.btn.btn-default.blue',
+        'tag:input@type=submit',
+        'text=登录'
+    )
+    if not login_btn:
+        raise RuntimeError("❌ 未找到登录按钮")
+    page.actions.move_to(login_btn).click().wait(0.5)
+    print("✅ 已点击登录按钮")
+    time.sleep(1)
+
+    error_msgs = page.eles('.error, #err, .msg-error, .alert-danger', timeout=1)
+    if error_msgs:
+        raise RuntimeError(f"登录失败: {error_msgs[0].text}")
+
+
+# ==================== 登录主函数 ====================
+def login_and_get_token(username: str, password: str, headless: bool = False) -> str:
+    """自动登录并返回 token"""
+    with browser_page(headless) as page:
+        for attempt in range(1, MAX_RETRIES + 1):
+            print(f"\n--- 第 {attempt} 次尝试登录 ---")
+            try:
+                _navigate_to_login(page)
+                _handle_iframe(page)
+                _fill_login_form(page, username, password)
+                _click_login_button(page)
+
+                # 等待 token
+                time.sleep(0.5)
+                page.get(LOGIN_URL)
+                time.sleep(2)
+                print("等待登录成功后跳转...")
+
+                token = _wait_for_login_redirect(page)
+                if token:
+                    remove_captcha_image()
+                    return token
+                raise RuntimeError("获取 token 超时或无效")
+
+            except Exception as e:
+                print(f"第 {attempt} 次尝试失败: {e}")
+                remove_captcha_image()
+                if attempt == MAX_RETRIES:
+                    raise
                 print("等待 2 秒后重试...")
                 time.sleep(2)
 
-    raise Exception(f"登录失败，已重试 {max_retries} 次。")
+        raise RuntimeError(f"登录失败，已重试 {MAX_RETRIES} 次。")
 
-# ==================== 打卡模块（使用浏览器发起请求） ====================
-def get_transition_today(token: str):
-    """获取今日任务（仍使用 requests，仅为查询，风险低）"""
-    url = "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday"
-    headers = {"fighter-auth-token": token}
-    data = {"pageNum": 1, "pageSize": 1}
-    resp = requests.post(url, headers=headers, data=data)
-    if resp.status_code != 200:
-        raise Exception(f"查询任务失败，HTTP状态码: {resp.status_code}")
-    resp_data = resp.json()
-    records = resp_data.get("data", {}).get("records", [])
-    return records[0] if records else None
 
-def get_student_id(token: str):
-    """获取学号（仍使用 requests）"""
-    url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
-    headers = {"fighter-auth-token": token}
-    resp = requests.get(url, headers=headers)
-    if resp.status_code != 200:
-        raise Exception(f"获取学号失败，HTTP状态码: {resp.status_code}")
-    return resp.json()["data"]["subject"]["username"]
+# ==================== 打卡模块 ====================
+def get_transition_today(token: str) -> dict:
+    """获取今日任务"""
+    result = api_request('POST', API_TASK_URL, token, data={"pageNum": 1, "pageSize": 1})
+    records = result.get("data", {}).get("records", [])
+    return records[0] if records else {}
 
-def checkin_with_page(page, token: str):
+
+def get_student_id(token: str) -> str:
+    """获取学号"""
+    result = api_request('GET', API_USER_URL, token)
+    return result["data"]["subject"]["username"]
+
+
+def build_checkin_payload(task: dict, student_id: str) -> dict:
+    """构造打卡 payload"""
+    start_time_str, end_time_str = generate_random_time_range(
+        CHECKIN_TIME_RANGE[0], CHECKIN_TIME_RANGE[1]
+    )
+    return {
+        "id": task["id"],
+        "formId": task["formId"],
+        "tsrq": time.strftime("%Y-%m-%d"),
+        "xh": student_id,
+        "qdsj": [start_time_str, end_time_str],
+    }
+
+
+def _checkin_common(token: str) -> Tuple[dict, str, bool]:
     """
-    使用浏览器页面提交打卡（全程同一浏览器，UA一致）
+    获取任务和学号，返回 (task, student_id, is_already_checked)
     """
+    task = get_transition_today(token)
+    if not task:
+        return {}, "", True   # 无任务，无需打卡
+    if task.get("qdzt") == "已签到":
+        return task, "", True  # 已签到
+    student_id = get_student_id(token)
+    print(f"当前用户学号: {student_id}")
+    return task, student_id, False
+
+
+def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str, int]:
+    """浏览器打卡"""
     try:
-        task = get_transition_today(token)
-        if not task:
-            msg = "今日无打卡任务"
-            print(f"ℹ️ {msg}")
-            return True, msg, 10
+        task, student_id, done = _checkin_common(token)
+        if done:
+            if not task:
+                return True, "今日无打卡任务", 10
+            return True, "今日已签到，无需重复", 0
 
-        if task.get("qdzt") == "已签到":
-            msg = "今日已签到，无需重复"
-            print(f"✅ {msg}")
-            return True, msg, 0
-
-        student_id = get_student_id(token)
-        print(f"当前用户学号: {student_id}")
-
-        formid = task["formId"]
-        record_id = task["id"]
-        url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
-        params = {"formId": formid, "isSubmitProcess": False}
+        payload = build_checkin_payload(task, student_id)
         headers = {
             "fighter-auth-token": token,
             "Content-Type": "application/json;charset=UTF-8"
         }
-        payload = {
-            "id": record_id,
-            "formId": formid,
-            "tsrq": time.strftime("%Y-%m-%d"),
-            "xh": student_id,
-            "qdsj": CHECKIN_TIME_RANGE,
-        }
 
-        # 通过浏览器的 fetch 提交，保证 TLS/UA 和登录时一致
         js_code = f'''
-            return fetch("{url}?formId={formid}&isSubmitProcess=false", {{
+            return fetch("{API_CHECKIN_URL}?formId={task['formId']}&isSubmitProcess=false", {{
                 method: "POST",
                 headers: {json.dumps(headers)},
                 body: JSON.stringify({json.dumps(payload)})
@@ -401,28 +463,39 @@ def checkin_with_page(page, token: str):
         '''
         result = page.run_js(js_code)
         if result and result.get("error"):
-            msg = f"打卡提交异常: {result['error']}"
-            print(f"❌ {msg}")
-            return False, msg, 20
+            return False, f"打卡提交异常: {result['error']}", 20
 
         if result.get("code") == 200 and result.get("data"):
-            msg = "打卡成功！"
-            print(f"✅ {msg}")
-            return True, msg, 0
-        else:
-            msg = f"打卡失败: {result.get('msg', '未知错误')}"
-            print(f"❌ {msg}")
-            return False, msg, 20
+            return True, "打卡成功！", 0
+        return False, f"打卡失败: {result.get('msg', '未知错误')}", 20
 
     except Exception as e:
-        msg = f"打卡过程中异常: {e}"
-        print(f"❌ {msg}")
-        return False, msg, 20
+        return False, f"打卡过程中异常: {e}", 20
+
+
+def checkin_with_requests(token: str) -> Tuple[bool, str, int]:
+    """requests 备用打卡"""
+    try:
+        task, student_id, done = _checkin_common(token)
+        if done:
+            if not task:
+                return True, "今日无打卡任务", 10
+            return True, "今日已签到，无需重复", 0
+
+        payload = build_checkin_payload(task, student_id)
+        params = {"formId": task["formId"], "isSubmitProcess": False}
+        result = api_request('POST', API_CHECKIN_URL, token, params=params, json_data=payload)
+        if result.get("code") == 200 and result.get("data"):
+            return True, "打卡成功！", 0
+        return False, f"打卡失败: {result.get('msg', '未知错误')}", 20
+    except Exception as e:
+        return False, f"异常: {e}", 20
+
 
 # ==================== 主程序 ====================
 def main():
-    parser = argparse.ArgumentParser(description='西南大学自动打卡（全程浏览器）')
-    parser.add_argument('--no-headless', action='store_true', help='禁用无头模式（显示浏览器）')
+    parser = argparse.ArgumentParser(description='西南大学自动打卡（整合版）')
+    parser.add_argument('--no-headless', action='store_true', help='禁用无头模式')
     args = parser.parse_args()
     headless_mode = not args.no_headless
 
@@ -432,13 +505,12 @@ def main():
         print("❌ 请设置环境变量 SWU_USERNAME 和 SWU_PASSWORD")
         sys.exit(1)
 
-    token = MANUAL_TOKEN.strip()
-    page = None
+    token: Optional[str] = os.environ.get('SWU_TOKEN', '').strip() or MANUAL_TOKEN.strip()
 
     if not token:
         print("未指定手动 token，将自动登录获取...")
         try:
-            page, token = login_and_get_page(username, password, headless=headless_mode)
+            token = login_and_get_token(username, password, headless=headless_mode)
             print(f"\n✅ 获取到的 token: {token[:10]}...")
         except Exception as e:
             print(f"❌ 自动登录失败: {e}")
@@ -452,76 +524,29 @@ def main():
             print(f"❌ Token 无效或已过期: {e}")
             sys.exit(1)
 
+    # 确保 token 非空
+    assert token is not None
+
     print("\n--- 开始打卡 ---")
-    if page:
-        # 使用浏览器提交
-        success, reason, exit_code = checkin_with_page(page, token)
-    else:
-        # 手动 token 时，无浏览器，退化为 requests 方式（保留原函数）
-        # 但为了保持一致性，也可调用原 checkin 函数，但这里我们复用原逻辑
-        # 简单起见，直接调用原 checkin（但已删除，需要重新定义？）
-        # 为了兼容手动 token，我们保留原来的 requests 提交函数，但因为我们修改了结构，下面临时实现
-        # 其实可以写一个 fallback 用 requests 提交，但鉴于用户主要使用自动登录，我们可简单处理
-        # 这里提供一个简化的 requests 提交（复用原有逻辑）
-        def fallback_checkin(token):
-            # 原 checkin 逻辑（使用 requests）
-            try:
-                task = get_transition_today(token)
-                if not task:
-                    return True, "今日无打卡任务", 10
-                if task.get("qdzt") == "已签到":
-                    return True, "今日已签到，无需重复", 0
-                student_id = get_student_id(token)
-                formid = task["formId"]
-                record_id = task["id"]
-                url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
-                params = {"formId": formid, "isSubmitProcess": False}
-                headers = {
-                    "fighter-auth-token": token,
-                    "Content-Type": "application/json;charset=UTF-8"
-                }
-                payload = {
-                    "id": record_id,
-                    "formId": formid,
-                    "tsrq": time.strftime("%Y-%m-%d"),
-                    "xh": student_id,
-                    "qdsj": CHECKIN_TIME_RANGE,
-                }
-                resp = requests.post(url, headers=headers, params=params, data=json.dumps(payload))
-                resp.raise_for_status()
-                data = resp.json()
-                if data.get("code") == 200 and data.get("data"):
-                    return True, "打卡成功！", 0
-                else:
-                    return False, f"打卡失败: {data.get('msg', '未知错误')}", 20
-            except Exception as e:
-                return False, f"异常: {e}", 20
+    use_browser = True
+    try:
+        with browser_page(headless_mode) as page:
+            success, reason, exit_code = checkin_with_page(page, token)
+    except Exception as e:
+        print(f"⚠️ 浏览器打卡失败，切换到 requests 方式: {e}")
+        use_browser = False
 
-        success, reason, exit_code = fallback_checkin(token)
+    if not use_browser:
+        success, reason, exit_code = checkin_with_requests(token)
 
-    # 清理浏览器资源（如果存在）
-    if page:
-        try:
-            page.quit()
-            print("✅ 浏览器已关闭")
-        except:
-            pass
-        # 清理用户数据目录
-        is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
-        user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci' if (headless_mode or is_ci) else 'chrome_user_data')
-        if os.path.exists(user_data_dir):
-            try:
-                shutil.rmtree(user_data_dir)
-                print(f"✅ 已清除浏览器数据目录: {user_data_dir}")
-            except Exception as e:
-                print(f"⚠️ 清除浏览器数据目录失败（可忽略）: {e}")
+    remove_captcha_image()
 
     if success:
         print(f"✅ 打卡流程完成：{reason}")
         sys.exit(0)
-    else:
-        print(f"❌ 打卡失败：{reason}")
-        sys.exit(1)
+    print(f"❌ 打卡失败：{reason}")
+    sys.exit(exit_code or 1)
+
 
 if __name__ == "__main__":
     main()
