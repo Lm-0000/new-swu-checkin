@@ -17,7 +17,7 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 # ==================== 配置区 ====================
 MANUAL_TOKEN = ""
 CHECKIN_TIME_RANGE = ["21:00", "23:30"]
-MAX_RETRIES = 2
+MAX_RETRIES = 3
 
 # ==================== 工具函数 ====================
 def get_chrome_path() -> str:
