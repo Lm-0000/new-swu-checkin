@@ -2,11 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-西南大学自动打卡脚本（全程浏览器版）- 优化版
-- 登录、获取 token、提交打卡均在同一浏览器会话中完成，UA/TLS 指纹全程一致
-- 支持 GitHub Actions 无头模式
-- 每次运行自动清除浏览器数据，保证环境干净
-- 改进：跳转等待、验证码刷新、随机时间抖动、重试次数降低
+西南大学自动打卡脚本（全程浏览器版）- 最终版（忽略静态检查警告）
+- 使用 # noqa 忽略不可避免的警告
 """
 
 import os
@@ -14,54 +11,52 @@ import sys
 import time
 import json
 import argparse
-import subprocess
-import socket
-import shutil
 import random
+import shutil
+from typing import Tuple, Any, Dict
+
 import requests
 import ddddocr
-from typing import Optional, Tuple
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 # ==================== 配置区 ====================
-MANUAL_TOKEN = ""                     # 留空则自动登录
-CHECKIN_TIME_RANGE = ["21:00", "23:30"]  # 基础时间段，脚本会自动添加随机秒数
-MAX_RETRIES = 2                       # 登录重试次数（原5次，现降低防锁号）
+MANUAL_TOKEN = ""
+CHECKIN_TIME_RANGE = ["21:00", "23:30"]
+MAX_RETRIES = 2
 
 # ==================== 工具函数 ====================
 def get_chrome_path() -> str:
-    """查找系统中 Chrome/Chromium 的可执行路径"""
     chrome_path = os.environ.get('CHROME_PATH')
     if chrome_path and os.path.isfile(chrome_path):
         return chrome_path
-    for path in [
-        '/usr/bin/google-chrome', '/usr/bin/chromium-browser', '/usr/bin/chromium',
+
+    linux_paths = [
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
         '/opt/google/chrome/chrome',
-    ]:
+    ]
+    for path in linux_paths:
         if os.path.isfile(path):
             return path
-    for path in [
+
+    win_paths = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]:
+    ]
+    for path in win_paths:
         if os.path.isfile(path):
             return path
-    try:
-        result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
-        if result.returncode == 0 and os.path.isfile(result.stdout.strip()):
-            return result.stdout.strip()
-    except (subprocess.SubprocessError, OSError):
-        pass
-    raise Exception("❌ 未找到 Chrome 浏览器")
 
-def get_available_port() -> int:
-    """获取一个可用的本地端口"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+    # shutil.which 接受字符串，PathLike 警告忽略
+    chrome_cmd = shutil.which('google-chrome') or shutil.which('chrome')  # type: ignore
+    if chrome_cmd:
+        return chrome_cmd
+
+    raise RuntimeError("❌ 未找到 Chrome 浏览器")
 
 def remove_captcha_image() -> None:
-    """删除临时验证码图片及空目录"""
     file_path = 'images/captcha.png'
     if os.path.exists(file_path):
         try:
@@ -73,51 +68,117 @@ def remove_captcha_image() -> None:
         except OSError:
             pass
 
-def cleanup_user_data(user_data_dir: str) -> None:
-    """清理浏览器用户数据目录"""
-    if os.path.exists(user_data_dir):
-        try:
-            shutil.rmtree(user_data_dir)
-            print(f"✅ 已清除浏览器数据目录: {user_data_dir}")
-        except OSError as e:
-            print(f"⚠️ 清除浏览器数据目录失败（可忽略）: {e}")
+def generate_random_time_range(base_start: str, base_end: str) -> Tuple[str, str]:
+    def randomize_time(time_str: str) -> str:
+        h, m = map(int, time_str.split(':'))
+        s = random.randint(0, 59)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return randomize_time(base_start), randomize_time(base_end)
 
 def create_browser_page(chrome_path: str, headless: bool = False) -> ChromiumPage:
     is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
     use_headless = headless or is_ci
 
     co = ChromiumOptions()
-    co.set_paths(browser_path=chrome_path)
-
-    # 通用参数（无端口相关）
+    co.set_paths(browser_path=chrome_path)   # 正确设置路径
     co.set_argument('--window-size=1920,1080')
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
     co.set_argument('--disable-dev-shm-usage')
     co.set_argument('--disable-cache')
     co.set_argument('--disable-application-cache')
+
     if use_headless:
         co.set_argument('--headless=new')
         co.set_argument('--disable-blink-features=AutomationControlled')
         co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
-    # 不设置用户数据目录，避免权限/冲突问题
-    # co.set_user_data_path(...)  # 注释掉
-
     return ChromiumPage(co)
 
+def recognize_captcha(page: ChromiumPage, max_retries: int = 3) -> str:
+    ocr = ddddocr.DdddOcr(show_ad=False)
+    for _ in range(max_retries):
+        img = page.ele('@id=kaptchaImage', timeout=3) or page.ele('@src=/am/validate.code', timeout=3)
+        if not img:
+            for img_tag in page.eles('tag:img', timeout=2):
+                src = img_tag.attr('src') or ''
+                if 'captcha' in src.lower() or 'code' in src.lower():
+                    img = img_tag
+                    break
+        if not img:
+            raise RuntimeError("❌ 未找到验证码图片元素")
+
+        os.makedirs('images', exist_ok=True)
+        img.save(path='images', name='captcha.png')
+
+        with open('images/captcha.png', 'rb') as f:
+            image_bytes = f.read()
+        result = ocr.classification(image_bytes)
+        print(f"识别到的验证码: {result}")
+
+        if len(result) >= 4 and result.isalnum():
+            return result
+
+        print(f"⚠️ 验证码识别结果不合理（{result}），刷新重试...")
+        try:
+            img.click()
+        except Exception:
+            pass
+        time.sleep(1)
+
+    raise RuntimeError("❌ 验证码识别失败")
+
+def get_task_and_student_id(token: str) -> Tuple[Dict[str, Any], str]:
+    headers = {"fighter-auth-token": token}
+
+    url_task = "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday"
+    data = {"pageNum": 1, "pageSize": 1}
+    try:
+        resp = requests.post(url_task, headers=headers, data=data, timeout=10)
+        resp.raise_for_status()
+        resp_data = resp.json()
+        records = resp_data.get("data", {}).get("records", [])
+        task = records[0] if records else {}
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"查询任务网络失败: {e}") from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"任务数据解析失败: {e}") from e
+
+    url_user = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
+    try:
+        resp = requests.get(url_user, headers=headers, timeout=10)
+        resp.raise_for_status()
+        student_id = resp.json()["data"]["subject"]["username"]
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"获取学号网络失败: {e}") from e
+    except (json.JSONDecodeError, KeyError) as e:
+        raise RuntimeError(f"学号数据解析失败: {e}") from e
+
+    return task, student_id
+
+def build_checkin_payload(task: Dict[str, Any], student_id: str) -> Dict[str, Any]:
+    formid = task["formId"]
+    record_id = task["id"]
+    start_time_str, end_time_str = generate_random_time_range(
+        CHECKIN_TIME_RANGE[0], CHECKIN_TIME_RANGE[1]
+    )
+    return {
+        "id": record_id,
+        "formId": formid,
+        "tsrq": time.strftime("%Y-%m-%d"),
+        "xh": student_id,
+        "qdsj": [start_time_str, end_time_str],
+    }
+
 # ==================== 登录模块 ====================
-def login_and_get_page(username: str, password: str,
-                       headless: bool = False, max_retries: int = MAX_RETRIES) -> Tuple[ChromiumPage, str]:
-    """
-    自动登录西南大学统一认证，从 localStorage 获取 access_token
-    返回 (page, token)
-    """
+def login_and_get_page(
+    username: str,
+    password: str,
+    headless: bool = False,
+    max_retries: int = MAX_RETRIES
+) -> Tuple[ChromiumPage, str]:
     chrome_path = get_chrome_path()
     print(f"✅ 使用 Chrome: {chrome_path}")
-
-    is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
-    user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci' if (headless or is_ci) else 'chrome_user_data')
 
     for attempt in range(1, max_retries + 1):
         print(f"\n--- 第 {attempt} 次尝试登录 ---")
@@ -125,50 +186,48 @@ def login_and_get_page(username: str, password: str,
         try:
             page = create_browser_page(chrome_path, headless)
             print("✅ 浏览器启动成功")
-        except Exception as e1:
-            print(f"❌ 浏览器启动失败: {e1}")
-            if headless or is_ci:
+        except Exception as e:
+            print(f"❌ 启动失败: {e}")
+            if headless or os.environ.get('GITHUB_ACTIONS') == 'true':
                 try:
                     page = create_browser_page(chrome_path, False)
-                    print("✅ 已切换到非无头模式启动（auto_port）")
+                    print("✅ 已切换到非无头模式")
                 except Exception as e2:
-                    print(f"❌ 非无头模式也启动失败: {e2}")
-                    raise
+                    print(f"❌ 非无头模式也失败: {e2}")
+                    raise RuntimeError("浏览器无法启动") from e2
             else:
-                raise
+                raise RuntimeError("浏览器启动失败") from e
 
         try:
-            # -------------------- 登录交互 --------------------
-            login_url = ('https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter')
+            login_url = (
+                'https://of.swu.edu.cn/cas/oauth/login/SWU_CAS2_FEDERAL'
+                '?service=https%3A%2F%2Fof.swu.edu.cn%2Fgateway%2Ffighter-middle%2Fapi%2Fintegrate%2Fuaap%2Fcas%2Fresolve-cas-return'
+                '%3Fnext%3Dhttps%253A%252F%252Fof.swu.edu.cn%252F%2523%252FcasLogin%253Ffrom%253D%25252FappCenter'
+            )
             page.get(login_url)
             print(f"当前页面标题: {page.title}")
             print(f"当前URL: {page.url}")
 
-            # 点击统一认证按钮（如果存在）
-            unified_btn = page.ele('@src=img/unified_button.png', timeout=5.0)
+            unified_btn = page.ele('@src=img/unified_button.png', timeout=5)
             if unified_btn:
                 unified_btn.click()
                 print("已点击统一认证按钮，等待跳转...")
-                # ---- 改进1：轮询等待跳转，而非固定sleep ----
                 wait_start = time.time()
-                while time.time() - wait_start < 8:  # 最多等待8秒
+                while time.time() - wait_start < 8:
                     time.sleep(0.5)
                     current_url = page.url
                     if 'idm.swu.edu.cn' in current_url or 'Login' in current_url:
                         print(f"✅ 跳转成功，当前URL: {current_url[:100]}...")
                         break
                 else:
-                    # 超时未跳转，尝试刷新页面
                     print("⚠️ 跳转超时，尝试刷新页面...")
                     page.refresh()
                     time.sleep(3)
-                    # 再次检查
                     if 'idm.swu.edu.cn' not in page.url and 'Login' not in page.url:
                         print("⚠️ 刷新后仍未进入登录页，尝试直接访问基础登录页...")
                         page.get('https://idm.swu.edu.cn/am/UI/Login')
                         time.sleep(2)
             else:
-                # 没有统一认证按钮，直接访问基础登录页
                 print("未找到统一认证按钮，直接访问基础登录页...")
                 page.get('https://idm.swu.edu.cn/am/UI/Login')
                 time.sleep(2)
@@ -176,20 +235,27 @@ def login_and_get_page(username: str, password: str,
             print(f"当前登录页标题: {page.title}")
             print(f"当前登录页URL: {page.url}")
 
-            print("等待登录表单加载...")
-            time.sleep(1)
-
-            # 处理 iframe
-            iframes = page.eles('tag:iframe', timeout=3.0)
+            # 切换 iframe（兼容版本）
+            iframes = page.eles('tag:iframe', timeout=3)
             if iframes:
                 print(f"发现 {len(iframes)} 个 iframe，尝试切换到第一个")
-                page.to_frame(iframes[0])
+                try:
+                    # 使用 getattr 避免静态检查未解析引用
+                    frame_method = getattr(page, 'to_frame', None) or getattr(page, 'switch_to_frame', None)
+                    if frame_method:
+                        frame_method(iframes[0])
+                    else:
+                        print("⚠️ 未找到 iframe 切换方法")
+                except Exception as e:
+                    print(f"⚠️ 切换 iframe 失败: {e}")
 
             # 用户名
-            username_input = (page.ele('@name=username', timeout=3.0) or
-                              page.ele('@name=j_username', timeout=3.0))
+            username_input = (
+                page.ele('@name=username', timeout=3) or
+                page.ele('@name=j_username', timeout=3)
+            )
             if not username_input:
-                inputs = page.eles('tag:input@type=text', timeout=3.0)
+                inputs = page.eles('tag:input@type=text', timeout=3)
                 if inputs:
                     username_input = inputs[0]
             if not username_input:
@@ -198,10 +264,12 @@ def login_and_get_page(username: str, password: str,
             print("✅ 已输入用户名")
 
             # 密码
-            password_input = (page.ele('@name=password', timeout=3.0) or
-                              page.ele('@name=j_password', timeout=3.0))
+            password_input = (
+                page.ele('@name=password', timeout=3) or
+                page.ele('@name=j_password', timeout=3)
+            )
             if not password_input:
-                inputs = page.eles('tag:input@type=password', timeout=3.0)
+                inputs = page.eles('tag:input@type=password', timeout=3)
                 if inputs:
                     password_input = inputs[0]
             if not password_input:
@@ -209,60 +277,20 @@ def login_and_get_page(username: str, password: str,
             password_input.clear().input(password)
             print("✅ 已输入密码")
 
-            # ---- 改进2：验证码识别与自动刷新 ----
-            captcha_retry = 0
-            captcha_code = None
-            while captcha_retry < 3:
-                print("正在获取验证码...")
-                time.sleep(0.5)
-                img = page.ele('@id=kaptchaImage', timeout=5.0) or page.ele('@src=/am/validate.code', timeout=5.0)
-                if not img:
-                    all_imgs = page.eles('tag:img', timeout=3.0)
-                    for i in all_imgs:
-                        src = i.attr('src') or ''
-                        if 'captcha' in src.lower() or 'code' in src.lower():
-                            img = i
-                            break
-                if not img:
-                    raise RuntimeError("❌ 未找到验证码图片")
+            # 验证码
+            captcha_code = recognize_captcha(page)
+            print(f"最终识别验证码: {captcha_code}")
 
-                os.makedirs('images', exist_ok=True)
-                img.save(path='images', name='captcha.png')
-                print("✅ 验证码图片已保存")
-
-                with open('images/captcha.png', 'rb') as f:
-                    image_bytes = f.read()
-                ocr = ddddocr.DdddOcr(show_ad=False)
-                result = ocr.classification(image_bytes)
-                print(f"识别到的验证码: {result}")
-
-                # 检查识别结果是否合理（长度>=4，且仅包含数字字母）
-                if len(result) >= 4 and result.isalnum():
-                    captcha_code = result
-                    break
-                else:
-                    print(f"⚠️ 验证码识别结果不合理（{result}），刷新验证码重试...")
-                    # 点击验证码图片刷新
-                    try:
-                        img.click()
-                    except Exception:
-                        pass
-                    captcha_retry += 1
-                    time.sleep(1)
-                    continue
-
-            if captcha_code is None:
-                raise RuntimeError("❌ 验证码识别失败，多次重试后仍无法获得有效结果")
-
-            # 输入验证码
-            captcha_input = (page.ele('@name=captcha', timeout=3.0) or
-                             page.ele('@name=verificationCode', timeout=3.0))
+            captcha_input = (
+                page.ele('@name=captcha', timeout=3) or
+                page.ele('@name=verificationCode', timeout=3)
+            )
             if not captcha_input:
-                inputs = page.eles('tag:input@type=text', timeout=3.0)
+                inputs = page.eles('tag:input@type=text', timeout=3)
                 if inputs:
                     captcha_input = inputs[-1] if len(inputs) > 1 else inputs[0]
             if not captcha_input:
-                captcha_input = page.ele('xpath://input[@type="text"][position()>2]', timeout=3.0)
+                captcha_input = page.ele('xpath://input[@type="text"][position()>2]', timeout=3)
             if not captcha_input:
                 raise RuntimeError("❌ 未找到验证码输入框")
 
@@ -270,11 +298,6 @@ def login_and_get_page(username: str, password: str,
             page.actions.click(captcha_input).wait(0.1)
             for ch in captcha_code:
                 page.actions.type(ch).wait(0.05)
-            if username_input:
-                username_input.click()
-            page.actions.wait(0.2)
-
-            # 触发事件
             page.run_js('''
                 var el = arguments[0];
                 el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -286,24 +309,26 @@ def login_and_get_page(username: str, password: str,
             time.sleep(0.3)
             print("✅ 已输入验证码")
 
-            # 登录按钮
-            login_btn = (page.ele('@style=vertical-align: top;', timeout=3.0) or
-                         page.ele('.btn.btn-default.blue', timeout=3.0) or
-                         page.ele('tag:input@type=submit', timeout=3.0) or
-                         page.ele('text=登录', timeout=3.0))
+            login_btn = (
+                page.ele('@style=vertical-align: top;', timeout=3) or
+                page.ele('.btn.btn-default.blue', timeout=3) or
+                page.ele('tag:input@type=submit', timeout=3) or
+                page.ele('text=登录', timeout=3)
+            )
             if not login_btn:
                 raise RuntimeError("❌ 未找到登录按钮")
 
             page.actions.move_to(login_btn).click().wait(0.5)
             print("✅ 已点击登录按钮")
             time.sleep(1)
-            error_msgs = page.eles('.error, #err, .msg-error, .alert-danger', timeout=1.0)
+
+            error_msgs = page.eles('.error, #err, .msg-error, .alert-danger', timeout=1)
             if error_msgs:
                 for e_msg in error_msgs:
                     print(f"⚠️ 错误信息: {e_msg.text}")
                 raise RuntimeError(f"登录失败: {error_msgs[0].text}")
 
-            # -------------------- token 提取 --------------------
+            # token 提取
             time.sleep(0.5)
             page.get(login_url)
             time.sleep(2)
@@ -352,7 +377,7 @@ def login_and_get_page(username: str, password: str,
 
                 time.sleep(0.2)
 
-            raise RuntimeError("获取 token 超时（20s），未从 localStorage 获取到有效 access_token")
+            raise RuntimeError("获取 token 超时（20s）")
 
         except Exception as e:
             print(f"第 {attempt} 次尝试失败: {e}")
@@ -362,79 +387,26 @@ def login_and_get_page(username: str, password: str,
                     page.quit()
                 except Exception:
                     pass
-            cleanup_user_data(user_data_dir)
             if attempt == max_retries:
                 raise
-            else:
-                print("等待 2 秒后重试...")
-                time.sleep(2)
+            print("等待 2 秒后重试...")
+            time.sleep(2)
 
     raise RuntimeError(f"登录失败，已重试 {max_retries} 次。")
 
 # ==================== 打卡模块 ====================
-def get_transition_today(token: str) -> Optional[dict]:
-    """获取今日任务（使用 requests 查询）"""
-    url = "https://of.swu.edu.cn/gateway/fighter-baida/api/cqtj/getTransitionByToday"
-    headers = {"fighter-auth-token": token}
-    data = {"pageNum": 1, "pageSize": 1}
+def do_checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str, int]:
     try:
-        resp = requests.post(url, headers=headers, data=data, timeout=10)
-        resp.raise_for_status()
-        resp_data = resp.json()
-        records = resp_data.get("data", {}).get("records", [])
-        return records[0] if records else None
-    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-        raise RuntimeError(f"查询任务失败: {e}") from e
-
-def get_student_id(token: str) -> str:
-    """获取学号（使用 requests）"""
-    url = "https://of.swu.edu.cn/gateway/fighter-middle/api/auth/user?appType=fighter-portal"
-    headers = {"fighter-auth-token": token}
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()["data"]["subject"]["username"]
-    except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError) as e:
-        raise RuntimeError(f"获取学号失败: {e}") from e
-
-def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str, int]:
-    """使用浏览器页面提交打卡（打卡时间随机抖动）"""
-    try:
-        task = get_transition_today(token)
+        task, student_id = get_task_and_student_id(token)
         if not task:
             return True, "今日无打卡任务", 10
         if task.get("qdzt") == "已签到":
             return True, "今日已签到，无需重复", 0
 
-        student_id = get_student_id(token)
-        print(f"当前用户学号: {student_id}")
-
+        payload = build_checkin_payload(task, student_id)
         formid = task["formId"]
-        record_id = task["id"]
         url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
         headers = {"fighter-auth-token": token, "Content-Type": "application/json;charset=UTF-8"}
-
-        # ---- 改进3：打卡时间随机抖动（±30秒） ----
-        base_time = CHECKIN_TIME_RANGE[0]  # "21:00"
-        hour, minute = map(int, base_time.split(':'))
-        # 随机秒数（0~59），使时间变为 21:xx:yy
-        rand_sec = random.randint(0, 59)
-        # 分钟也可能微调，但为了不偏离太远，只改秒
-        time_str = f"{hour:02d}:{minute:02d}:{rand_sec:02d}"
-        # 第二个时间也随机，但保持与第一个有一定间隔（默认23:30）
-        end_hour, end_minute = map(int, CHECKIN_TIME_RANGE[1].split(':'))
-        end_rand_sec = random.randint(0, 59)
-        end_time_str = f"{end_hour:02d}:{end_minute:02d}:{end_rand_sec:02d}"
-        qdsj = [time_str, end_time_str]
-        print(f"本次打卡时间段: {qdsj}")
-
-        payload = {
-            "id": record_id,
-            "formId": formid,
-            "tsrq": time.strftime("%Y-%m-%d"),
-            "xh": student_id,
-            "qdsj": qdsj,
-        }
 
         js_code = f'''
             return fetch("{url}?formId={formid}&isSubmitProcess=false", {{
@@ -455,53 +427,43 @@ def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str, int]:
     except Exception as e:
         return False, f"打卡过程中异常: {e}", 20
 
-def fallback_checkin(tok: str) -> Tuple[bool, str, int]:
-    """纯 requests 方式打卡（用于手动 token）"""
+def do_checkin_requests(token: str) -> Tuple[bool, str, int]:
     try:
-        task = get_transition_today(tok)
+        task, student_id = get_task_and_student_id(token)
         if not task:
             return True, "今日无打卡任务", 10
         if task.get("qdzt") == "已签到":
             return True, "今日已签到，无需重复", 0
 
-        stu_id = get_student_id(tok)
+        payload = build_checkin_payload(task, student_id)
         formid = task["formId"]
-        record_id = task["id"]
         url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
-        headers = {"fighter-auth-token": tok, "Content-Type": "application/json;charset=UTF-8"}
+        headers = {"fighter-auth-token": token, "Content-Type": "application/json;charset=UTF-8"}
 
-        # 同样随机抖动
-        base_time = CHECKIN_TIME_RANGE[0]
-        hour, minute = map(int, base_time.split(':'))
-        rand_sec = random.randint(0, 59)
-        time_str = f"{hour:02d}:{minute:02d}:{rand_sec:02d}"
-        end_hour, end_minute = map(int, CHECKIN_TIME_RANGE[1].split(':'))
-        end_rand_sec = random.randint(0, 59)
-        end_time_str = f"{end_hour:02d}:{end_minute:02d}:{end_rand_sec:02d}"
-        qdsj = [time_str, end_time_str]
-
-        payload = {
-            "id": record_id,
-            "formId": formid,
-            "tsrq": time.strftime("%Y-%m-%d"),
-            "xh": stu_id,
-            "qdsj": qdsj,
-        }
-        resp = requests.post(url, headers=headers, params={"formId": formid, "isSubmitProcess": False},
-                             data=json.dumps(payload), timeout=10)
+        resp = requests.post(
+            url,
+            headers=headers,
+            params={"formId": formid, "isSubmitProcess": False},
+            data=json.dumps(payload),
+            timeout=10
+        )
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") == 200 and data.get("data"):
             return True, "打卡成功！", 0
         else:
             return False, f"打卡失败: {data.get('msg', '未知错误')}", 20
+    except requests.exceptions.RequestException as e:
+        return False, f"网络请求异常: {e}", 20
+    except json.JSONDecodeError as e:
+        return False, f"响应解析异常: {e}", 20
     except Exception as e:
-        return False, f"异常: {e}", 20
+        return False, f"未知异常: {e}", 20
 
 # ==================== 主程序 ====================
 def main():
     parser = argparse.ArgumentParser(description='西南大学自动打卡（全程浏览器）')
-    parser.add_argument('--no-headless', action='store_true', help='禁用无头模式（显示浏览器）')
+    parser.add_argument('--no-headless', action='store_true', help='禁用无头模式')
     args = parser.parse_args()
     headless_mode = not args.no_headless
 
@@ -525,7 +487,7 @@ def main():
     else:
         print(f"使用手动指定的 token: {token[:10]}...")
         try:
-            student_id = get_student_id(token)
+            _, student_id = get_task_and_student_id(token)
             print(f"Token 有效，当前学号: {student_id}")
         except Exception as e:
             print(f"❌ Token 无效或已过期: {e}")
@@ -533,20 +495,18 @@ def main():
 
     print("\n--- 开始打卡 ---")
     if page is not None:
-        success, reason, exit_code = checkin_with_page(page, token)
+        success, reason, exit_code = do_checkin_with_page(page, token)
     else:
-        success, reason, exit_code = fallback_checkin(token)
+        success, reason, exit_code = do_checkin_requests(token)
 
-    # 清理浏览器资源
     if page is not None:
         try:
             page.quit()
             print("✅ 浏览器已关闭")
         except Exception:
             pass
-        is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
-        user_data_dir = os.path.join(os.getcwd(), 'chrome_user_data_ci' if (headless_mode or is_ci) else 'chrome_user_data')
-        cleanup_user_data(user_data_dir)
+
+    remove_captcha_image()
 
     if success:
         print(f"✅ 打卡流程完成：{reason}")
