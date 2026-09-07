@@ -6,9 +6,8 @@ import sys
 import time
 import json
 import argparse
-import random
 import shutil
-from typing import Tuple, Optional, Any
+from typing import Tuple, Generator, Optional, Any
 from contextlib import contextmanager
 
 import requests
