@@ -78,8 +78,7 @@ def browser_page(headless: bool = False) -> Generator[ChromiumPage, None, None]:
     is_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
     use_headless = headless or is_ci
     co = ChromiumOptions()
-    # 修复：使用 set_browser_path（DrissionPage 新版本 API）
-    co.set_browser_path(chrome_path)
+    co.set_paths(browser_path=chrome_path)
     co.set_argument('--window-size=1920,1080')
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
@@ -331,16 +330,11 @@ def login_and_get_token(username: str, password: str, headless: bool = False) ->
                 time.sleep(2)
         raise RuntimeError(f"登录失败，已重试 {MAX_RETRIES} 次。")
 
-# ==================== 统一任务获取（修复重复代码） ====================
-def get_today_task(token: str) -> dict:
-    """获取今日打卡任务，返回任务字典（可能为空）"""
+# ==================== 打卡辅助函数（来自文件一） ====================
+def get_transition_today(token: str) -> dict:
     result = api_request('POST', API_TASK_URL, token, data={"pageNum": 1, "pageSize": 1})
     records = result.get("data", {}).get("records", [])
     return records[0] if records else {}
-
-def is_already_checked(task: dict) -> bool:
-    """判断任务是否已签到"""
-    return task.get("qdzt") == "已签到"
 
 def get_student_id(token: str) -> str:
     result = api_request('GET', API_USER_URL, token)
@@ -358,45 +352,47 @@ def build_checkin_payload(task: dict, student_id: str) -> dict:
         "qdsj": [start_time_str, end_time_str],
     }
 
+def _checkin_common(token: str) -> Tuple[dict, str, bool]:
+    task = get_transition_today(token)
+    if not task:
+        return {}, "", True
+    if task.get("qdzt") == "已签到":
+        return task, "", True
+    student_id = get_student_id(token)
+    print(f"当前用户学号: {student_id}")
+    return task, student_id, False
+
 # ==================== 打卡模块（浏览器 fetch，来自文件二，修复跨域） ====================
-def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str]:
+def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str, int]:
     """
     使用浏览器页面提交打卡。
     修复：先导航到 of.swu.edu.cn 确保同源。
-    返回 (成功与否, 消息)
     """
     try:
-        # 确保页面在 of.swu.edu.cn 域下
+        # ---------- 新增：确保页面在 of.swu.edu.cn 域下 ----------
         print("正在导航到 of.swu.edu.cn 以建立同源环境...")
         page.get('https://of.swu.edu.cn')
         time.sleep(1)
+        # -------------------------------------------------------
 
-        task = get_today_task(token)
+        task = get_transition_today(token)
         if not task:
             msg = "今日无打卡任务"
             print(f"ℹ️ {msg}")
-            return True, msg
+            return True, msg, 10
 
-        if is_already_checked(task):
+        if task.get("qdzt") == "已签到":
             msg = "今日已签到，无需重复"
             print(f"✅ {msg}")
-            return True, msg
+            return True, msg, 0
 
         student_id = get_student_id(token)
-        # 修复：取后三位（字符串切片）
-        print(f"当前用户后三位: {student_id[-3:] if len(student_id) >= 3 else student_id}")
+        print(f"当前用户后三位: {student_id%1000}")
 
         formid = task["formId"]
         record_id = task["id"]
         url = "https://of.swu.edu.cn/gateway/fighter-baida/api/form-instance/save"
-        # 生成随机时间
-        start_time, end_time = generate_random_time_range(
-            CHECKIN_TIME_RANGE[0], CHECKIN_TIME_RANGE[1]
-        )
         params = {"formId": formid, "isSubmitProcess": False}
-        query = "&".join(f"{k}={v}" for k, v in params.items())
-        full_url = f"{url}?{query}"
-
         headers = {
             "fighter-auth-token": token,
             "Content-Type": "application/json;charset=UTF-8"
@@ -406,11 +402,11 @@ def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str]:
             "formId": formid,
             "tsrq": time.strftime("%Y-%m-%d"),
             "xh": student_id,
-            "qdsj": [start_time, end_time],
+            "qdsj": CHECKIN_TIME_RANGE,
         }
 
         js_code = f'''
-            return fetch("{full_url}", {{
+            return fetch("{url}?formId={formid}&isSubmitProcess=false", {{
                 method: "POST",
                 headers: {json.dumps(headers)},
                 body: JSON.stringify({json.dumps(payload)})
@@ -422,40 +418,38 @@ def checkin_with_page(page: ChromiumPage, token: str) -> Tuple[bool, str]:
         if result and result.get("error"):
             msg = f"打卡提交异常: {result['error']}"
             print(f"❌ {msg}")
-            return False, msg
+            return False, msg, 20
 
         if result.get("code") == 200 and result.get("data"):
             msg = "打卡成功！"
             print(f"✅ {msg}")
-            return True, msg
+            return True, msg, 0
         else:
             msg = f"打卡失败: {result.get('msg', '未知错误')}"
             print(f"❌ {msg}")
-            return False, msg
+            return False, msg, 20
 
     except Exception as e:
         msg = f"打卡过程中异常: {e}"
         print(f"❌ {msg}")
-        return False, msg
+        return False, msg, 20
 
 # ==================== 备用打卡（requests，来自文件一） ====================
-def checkin_with_requests(token: str) -> Tuple[bool, str]:
+def checkin_with_requests(token: str) -> Tuple[bool, str, int]:
     try:
-        task = get_today_task(token)
-        if not task:
-            return True, "今日无打卡任务"
-        if is_already_checked(task):
-            return True, "今日已签到，无需重复"
-
-        student_id = get_student_id(token)
+        task, student_id, done = _checkin_common(token)
+        if done:
+            if not task:
+                return True, "今日无打卡任务", 10
+            return True, "今日已签到，无需重复", 0
         payload = build_checkin_payload(task, student_id)
         params = {"formId": task["formId"], "isSubmitProcess": False}
         result = api_request('POST', API_CHECKIN_URL, token, params=params, json_data=payload)
         if result.get("code") == 200 and result.get("data"):
-            return True, "打卡成功！"
-        return False, f"打卡失败: {result.get('msg', '未知错误')}"
+            return True, "打卡成功！", 0
+        return False, f"打卡失败: {result.get('msg', '未知错误')}", 20
     except Exception as e:
-        return False, f"异常: {e}"
+        return False, f"异常: {e}", 20
 
 # ==================== 主程序 ====================
 def main():
@@ -495,9 +489,10 @@ def main():
     # 优先尝试浏览器打卡，若失败则自动降级到 requests
     browser_success = False
     browser_reason = ""
+    browser_exit_code = 1
     try:
         with browser_page(headless_mode) as page:
-            browser_success, browser_reason = checkin_with_page(page, token)
+            browser_success, browser_reason, browser_exit_code = checkin_with_page(page, token)
     except Exception as e:
         print(f"⚠️ 浏览器打卡过程抛出异常: {e}")
         browser_success = False
@@ -509,14 +504,14 @@ def main():
         sys.exit(0)
     else:
         print(f"⚠️ 浏览器打卡失败（{browser_reason}），切换到 requests 备用方式...")
-        success, reason = checkin_with_requests(token)
+        success, reason, exit_code = checkin_with_requests(token)
         remove_captcha_image()
         if success:
             print(f"✅ 打卡流程完成（requests方式）：{reason}")
             sys.exit(0)
         else:
             print(f"❌ 打卡失败（requests方式）：{reason}")
-            sys.exit(1)
+            sys.exit(exit_code or 1)
 
 if __name__ == "__main__":
     main()
